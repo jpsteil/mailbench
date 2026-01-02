@@ -1,2 +1,2 @@
-exchangelib
-tkinterweb
+requests>=2.28
+tkinterweb>=3.0
