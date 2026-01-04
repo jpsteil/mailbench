@@ -102,6 +102,28 @@ class KerioSession:
         """Get current user info."""
         return self.call("Session.whoAmI")
 
+    def get_signature(self) -> str:
+        """Get user's email signature from webmail settings."""
+        import re
+        try:
+            # Signature is in the dynamically generated defaults JS file
+            url = f"https://{self.config.server}/webmail/generatedDefaults.js"
+            headers = {"X-Token": self.token} if self.token else {}
+            resp = self.session.get(url, headers=headers, timeout=10)
+
+            if resp.status_code != 200:
+                return ""
+
+            # Extract mailSignature field
+            match = re.search(r'mailSignature:\s*("(?:[^"\\]|\\.)*")', resp.text)
+            if match:
+                # Use json.loads to decode the escaped string
+                return json.loads(match.group(1))
+            return ""
+        except Exception:
+            return ""
+
+
 
 class KerioError(Exception):
     """Kerio API error."""
@@ -146,6 +168,16 @@ class KerioConnectionPool:
             for session in self._sessions.values():
                 try:
                     session.logout()
+                except Exception:
+                    pass
+            self._sessions.clear()
+
+    def close_all(self):
+        """Close all sessions immediately without logout (for fast shutdown)."""
+        with self._lock:
+            for session in self._sessions.values():
+                try:
+                    session.session.close()  # Close requests.Session
                 except Exception:
                     pass
             self._sessions.clear()
@@ -828,6 +860,23 @@ class SyncManager:
 
             except Exception as e:
                 self._ui_callback(callback, False, str(e), [])
+
+        self.executor.submit(do_fetch)
+
+    def fetch_signature(self, account_id: int, callback: Optional[Callable] = None):
+        """Fetch user's email signature."""
+        def do_fetch():
+            try:
+                session = self.pool.get_session(account_id)
+                if not session:
+                    self._ui_callback(callback, False, "Not connected", "")
+                    return
+
+                signature = session.get_signature()
+                self._ui_callback(callback, True, None, signature)
+
+            except Exception as e:
+                self._ui_callback(callback, False, str(e), "")
 
         self.executor.submit(do_fetch)
 

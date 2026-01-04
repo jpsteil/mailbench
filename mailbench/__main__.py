@@ -3,6 +3,15 @@
 import sys
 
 
+def check_pyside6():
+    """Check if PySide6 is available."""
+    try:
+        import PySide6
+        return True
+    except ImportError:
+        return False
+
+
 def check_tkinter():
     """Check if tkinter is available and provide installation instructions if not."""
     try:
@@ -71,6 +80,8 @@ def check_tkinter():
 
 def main():
     """Main entry point with argument handling."""
+    use_tk = False
+
     if len(sys.argv) > 1:
         arg = sys.argv[1].lower()
 
@@ -84,6 +95,9 @@ def main():
             success = remove_launcher()
             sys.exit(0 if success else 1)
 
+        elif arg == "--tk":
+            use_tk = True
+
         elif arg in ("--help", "-h"):
             print("Mailbench - Python Email Client for Kerio Connect")
             print()
@@ -92,16 +106,21 @@ def main():
             print("Options:")
             print("  --install-launcher   Create a desktop launcher for this OS")
             print("  --remove-launcher    Remove the desktop launcher")
+            print("  --tk                 Use tkinter UI instead of Qt")
             print("  --help, -h           Show this help message")
             print()
             print("Run without arguments to start the application.")
             sys.exit(0)
 
-    if not check_tkinter():
-        sys.exit(1)
-
-    from mailbench.app import main as app_main
-    app_main()
+    # Use Qt by default if available, fall back to tkinter
+    if use_tk or not check_pyside6():
+        if not check_tkinter():
+            sys.exit(1)
+        from mailbench.app import main as app_main
+        app_main()
+    else:
+        from mailbench.app_qt import main as app_main
+        app_main()
 
 
 if __name__ == "__main__":
