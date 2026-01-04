@@ -141,6 +141,34 @@ class MessageListModel(QAbstractListModel):
 
         return None
 
+    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
+        """Return item flags - enable dragging."""
+        default_flags = super().flags(index)
+        if index.isValid():
+            return default_flags | Qt.ItemFlag.ItemIsDragEnabled
+        return default_flags
+
+    def mimeTypes(self) -> list[str]:
+        """Return supported MIME types for drag."""
+        return ["application/x-mailbench-message"]
+
+    def mimeData(self, indexes: list[QModelIndex]):
+        """Create MIME data for drag operation."""
+        from PySide6.QtCore import QMimeData
+        mime_data = QMimeData()
+        item_ids = []
+        for index in indexes:
+            if index.isValid():
+                msg = self._filtered_messages[index.row()]
+                item_ids.append(msg.item_id)
+        if item_ids:
+            mime_data.setData("application/x-mailbench-message", ",".join(item_ids).encode())
+        return mime_data
+
+    def supportedDragActions(self) -> Qt.DropAction:
+        """Return supported drag actions."""
+        return Qt.DropAction.MoveAction
+
     def clear(self):
         """Clear all messages."""
         self.beginResetModel()
@@ -409,6 +437,9 @@ class MessageDelegate(QStyledItemDelegate):
 class FolderTreeModel(QStandardItemModel):
     """Model for the folder tree."""
 
+    # Signal emitted when messages are dropped on a folder (item_ids, account_id, folder_id)
+    messagesDropped = Signal(list, int, str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setHorizontalHeaderLabels(["Accounts"])
@@ -507,6 +538,67 @@ class FolderTreeModel(QStandardItemModel):
         # Remove folders group reference
         if account_id in self._folders_group_items:
             del self._folders_group_items[account_id]
+
+    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
+        """Return item flags - enable dropping on folder items."""
+        default_flags = super().flags(index)
+        if index.isValid():
+            item = self.itemFromIndex(index)
+            if item:
+                data = item.data(Qt.ItemDataRole.UserRole)
+                # Enable drop only on folder items
+                if data and data[0] == "folder":
+                    return default_flags | Qt.ItemFlag.ItemIsDropEnabled
+        return default_flags
+
+    def mimeTypes(self) -> list[str]:
+        """Return supported MIME types for drop."""
+        return ["application/x-mailbench-message"]
+
+    def supportedDropActions(self) -> Qt.DropAction:
+        """Return supported drop actions."""
+        return Qt.DropAction.MoveAction
+
+    def canDropMimeData(self, data, action, row, column, parent) -> bool:
+        """Check if drop is allowed."""
+        if not data.hasFormat("application/x-mailbench-message"):
+            return False
+        if not parent.isValid():
+            return False
+        item = self.itemFromIndex(parent)
+        if item:
+            item_data = item.data(Qt.ItemDataRole.UserRole)
+            # Only allow drop on folder items
+            return item_data and item_data[0] == "folder"
+        return False
+
+    def dropMimeData(self, data, action, row, column, parent) -> bool:
+        """Handle the drop - move messages to folder."""
+        if not data.hasFormat("application/x-mailbench-message"):
+            return False
+        if not parent.isValid():
+            return False
+
+        item = self.itemFromIndex(parent)
+        if not item:
+            return False
+
+        item_data = item.data(Qt.ItemDataRole.UserRole)
+        if not item_data or item_data[0] != "folder":
+            return False
+
+        account_id = item_data[1]
+        folder_id = item_data[2]
+
+        # Parse the dropped message IDs
+        raw_data = data.data("application/x-mailbench-message").data().decode()
+        item_ids = [id.strip() for id in raw_data.split(",") if id.strip()]
+
+        if item_ids:
+            # Emit signal with the message IDs and target folder
+            self.messagesDropped.emit(item_ids, account_id, folder_id)
+
+        return True
 
 
 class MessageWindow(QMainWindow):
@@ -861,6 +953,7 @@ class MailbenchWindow(QMainWindow):
         folder_layout.setSpacing(0)
 
         self._folder_model = FolderTreeModel()
+        self._folder_model.messagesDropped.connect(self._on_messages_dropped)
         self._folder_tree = QTreeView()
         self._folder_tree.setModel(self._folder_model)
         self._folder_tree.setHeaderHidden(True)
@@ -870,6 +963,10 @@ class MailbenchWindow(QMainWindow):
         self._folder_tree.doubleClicked.connect(self._on_folder_double_clicked)
         self._folder_tree.expanded.connect(self._on_folder_expanded)
         self._folder_tree.collapsed.connect(self._on_folder_collapsed)
+        # Enable drop
+        self._folder_tree.setAcceptDrops(True)
+        self._folder_tree.setDropIndicatorShown(True)
+        self._folder_tree.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
         folder_layout.addWidget(self._folder_tree)
 
         self._splitter.addWidget(folder_widget)
@@ -908,6 +1005,9 @@ class MailbenchWindow(QMainWindow):
         self._message_list.doubleClicked.connect(self._on_message_double_clicked)
         self._message_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._message_list.customContextMenuRequested.connect(self._show_context_menu)
+        # Enable drag
+        self._message_list.setDragEnabled(True)
+        self._message_list.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
         # Handle keyboard navigation
         self._message_list.selectionModel().currentChanged.connect(self._on_message_selection_changed)
         message_layout.addWidget(self._message_list)
@@ -1797,6 +1897,21 @@ class MailbenchWindow(QMainWindow):
             self._message_model.remove_message(item_id)
         else:
             self._statusbar.showMessage(f"Move failed: {error}")
+
+    def _on_messages_dropped(self, item_ids: list, account_id: int, folder_id: str):
+        """Handle messages dropped on a folder (drag and drop)."""
+        if not item_ids:
+            return
+
+        # Show status
+        count = len(item_ids)
+        self._statusbar.showMessage(f"Moving {count} message{'s' if count > 1 else ''}...")
+
+        for item_id in item_ids:
+            self.sync_manager.move_message(
+                account_id, item_id, folder_id,
+                callback=lambda s, e, iid=item_id: self._on_message_moved(s, e, iid)
+            )
 
     # ==================== Compose (Inline) ====================
 
