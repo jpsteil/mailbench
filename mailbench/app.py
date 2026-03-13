@@ -2,6 +2,7 @@
 
 import sys
 import os
+import re
 import tempfile
 import subprocess
 import platform
@@ -14,10 +15,12 @@ from PySide6.QtWidgets import (
     QSplitter, QTreeView, QListView, QTextEdit, QLabel, QLineEdit,
     QToolBar, QStatusBar, QMenu, QMenuBar, QMessageBox, QFrame,
     QStyledItemDelegate, QStyle, QAbstractItemView, QSizePolicy,
-    QPushButton, QDialog, QFileDialog, QGridLayout, QStackedWidget
+    QPushButton, QDialog, QFileDialog, QGridLayout, QStackedWidget,
+    QToolButton
 )
 try:
     from PySide6.QtWebEngineWidgets import QWebEngineView
+    from PySide6.QtWebEngineCore import QWebEngineSettings
     HAS_WEBENGINE = True
 except ImportError:
     HAS_WEBENGINE = False
@@ -35,6 +38,150 @@ from PySide6.QtGui import (
 from mailbench.database import Database
 from mailbench.kerio_client import KerioConnectionPool, SyncManager, KerioConfig
 from mailbench.version import __version__
+
+
+def block_remote_images(html: str) -> str:
+    """Block remote images to prevent tracking pixels and IP leakage.
+
+    Security: Remote images are commonly used for email tracking:
+    - Tracking pixels (1x1 images) confirm when/if an email was opened
+    - Remote images reveal your IP address to the sender
+    - Some tracking pixels include unique IDs per recipient
+
+    This function replaces remote image URLs with about:blank.
+    Keeps data: URLs for inline images (these are already in the email).
+    """
+    if not html:
+        return html
+
+    # Block remote image sources (http, https, protocol-relative)
+    # Keep data: URLs as they're inline images, not remote
+    html = re.sub(
+        r'(<img[^>]*\s+src\s*=\s*["\']?)\s*(https?://[^"\'>\s]*|//[^"\'>\s]*)',
+        r'\1about:blank',
+        html, flags=re.IGNORECASE
+    )
+
+    # Also block remote sources in srcset
+    html = re.sub(
+        r'(<img[^>]*\s+srcset\s*=\s*["\'])[^"\']*(["\'])',
+        r'\1\2',
+        html, flags=re.IGNORECASE
+    )
+
+    # Block remote background images in inline styles
+    html = re.sub(
+        r'(style\s*=\s*["\'][^"\']*background[^:]*:\s*url\s*\(\s*["\']?)\s*(https?://[^"\')\s]*|//[^"\')\s]*)',
+        r'\1about:blank',
+        html, flags=re.IGNORECASE
+    )
+
+    return html
+
+
+def sanitize_html(html: str) -> str:
+    """Sanitize HTML email content to prevent XSS attacks.
+
+    Removes:
+    - script, iframe, object, embed, link, meta, base, form tags
+    - Event handlers (onclick, onerror, onload, etc.)
+    - javascript: and data: URLs
+    - style tags (can contain CSS expressions)
+    """
+    if not html:
+        return html
+
+    # Remove dangerous tags completely (including contents for script/style)
+    # Tags whose content should be removed entirely
+    for tag in ['script', 'style']:
+        html = re.sub(
+            rf'<{tag}[^>]*>.*?</{tag}>',
+            '', html, flags=re.IGNORECASE | re.DOTALL
+        )
+
+    # Tags to remove (but keep content for some)
+    dangerous_tags = ['iframe', 'object', 'embed', 'link', 'meta', 'base', 'form', 'input', 'button', 'textarea']
+    for tag in dangerous_tags:
+        # Remove opening tags
+        html = re.sub(rf'<{tag}[^>]*>', '', html, flags=re.IGNORECASE)
+        # Remove closing tags
+        html = re.sub(rf'</{tag}>', '', html, flags=re.IGNORECASE)
+
+    # Remove event handlers (on* attributes)
+    html = re.sub(
+        r'\s+on\w+\s*=\s*["\'][^"\']*["\']',
+        '', html, flags=re.IGNORECASE
+    )
+    html = re.sub(
+        r'\s+on\w+\s*=\s*[^\s>]+',
+        '', html, flags=re.IGNORECASE
+    )
+
+    # Remove javascript: URLs
+    html = re.sub(
+        r'(href|src|action)\s*=\s*["\']?\s*javascript:[^"\'>\s]*["\']?',
+        r'\1=""', html, flags=re.IGNORECASE
+    )
+
+    # Remove data: URLs (can embed scripts)
+    html = re.sub(
+        r'(href|src)\s*=\s*["\']?\s*data:[^"\'>\s]*["\']?',
+        r'\1=""', html, flags=re.IGNORECASE
+    )
+
+    return html
+
+
+# Custom WebEngine page to intercept link clicks
+if HAS_WEBENGINE:
+    from PySide6.QtWebEngineCore import QWebEnginePage
+
+    class SafeLinkPage(QWebEnginePage):
+        """WebEngine page that intercepts link clicks for safety checks."""
+
+        def acceptNavigationRequest(self, url, nav_type, is_main_frame):
+            # Only intercept link clicks, not initial page loads
+            if nav_type == QWebEnginePage.NavigationType.NavigationTypeLinkClicked:
+                url_str = url.toString()
+
+                # Skip empty or javascript URLs
+                if not url_str or url_str.startswith('javascript:'):
+                    return False
+
+                # Build warning message
+                warnings = []
+
+                # Check for HTTP (not HTTPS)
+                if url_str.startswith('http://'):
+                    warnings.append("• This link uses HTTP (not secure)")
+
+                # Show confirmation dialog
+                from PySide6.QtWidgets import QMessageBox
+                msg = QMessageBox()
+                msg.setWindowTitle("Open Link")
+                msg.setIcon(QMessageBox.Icon.Question)
+
+                safety_tip = "Before opening, verify this goes where you expect. Attackers often disguise malicious links."
+
+                if warnings:
+                    msg.setText("This link has security concerns:")
+                    msg.setInformativeText("\n".join(warnings) + f"\n\n{safety_tip}\n\nURL: {url_str}")
+                else:
+                    msg.setText("Open this link in your browser?")
+                    msg.setInformativeText(f"{safety_tip}\n\nURL: {url_str}")
+
+                msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                msg.setDefaultButton(QMessageBox.StandardButton.No if warnings else QMessageBox.StandardButton.Yes)
+
+                if msg.exec() == QMessageBox.StandardButton.Yes:
+                    # Open in external browser
+                    from PySide6.QtGui import QDesktopServices
+                    QDesktopServices.openUrl(url)
+
+                return False  # Don't navigate in the email viewer
+
+            # Allow other navigation (initial load, etc.)
+            return super().acceptNavigationRequest(url, nav_type, is_main_frame)
 
 
 # Icons (Unicode)
@@ -240,6 +387,28 @@ class MessageListModel(QAbstractListModel):
                     model_index = self.index(i)
                     self.dataChanged.emit(model_index, model_index)
                     break
+
+    def update_messages(self, messages_data: list[dict]):
+        """Update multiple messages (for auto-refresh without disruption)."""
+        changed = False
+        for msg_data in messages_data:
+            item_id = msg_data.get('item_id')
+            idx = self._message_map.get(item_id)
+            if idx is not None and idx < len(self._messages):
+                old_msg = self._messages[idx]
+                new_is_read = msg_data.get('is_read', old_msg.is_read)
+                new_is_flagged = msg_data.get('is_flagged', old_msg.is_flagged)
+                if old_msg.is_read != new_is_read or old_msg.is_flagged != new_is_flagged:
+                    old_msg.is_read = new_is_read
+                    old_msg.is_flagged = new_is_flagged
+                    changed = True
+        if changed:
+            # Emit data changed for entire list
+            if self._filtered_messages:
+                self.dataChanged.emit(
+                    self.index(0),
+                    self.index(len(self._filtered_messages) - 1)
+                )
 
     def remove_message(self, item_id: str):
         """Remove a message."""
@@ -604,10 +773,11 @@ class FolderTreeModel(QStandardItemModel):
 class MessageWindow(QMainWindow):
     """Separate window for viewing a message."""
 
-    def __init__(self, parent, msg_data: dict, full_data: dict = None, dark_mode: bool = False):
+    def __init__(self, parent, msg_data: dict, full_data: dict = None, dark_mode: bool = False, account_id: int = None):
         super().__init__(parent)
         self.msg_data = msg_data
         self.full_data = full_data or {}
+        self.account_id = account_id
         self._dark_mode = dark_mode
 
         subject = msg_data.get('subject', '(No Subject)')
@@ -632,6 +802,31 @@ class MessageWindow(QMainWindow):
         event.accept()
 
     def _create_ui(self):
+        # Toolbar matching main window style
+        toolbar = QToolBar("Message Toolbar")
+        toolbar.setMovable(False)
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+        toolbar.setIconSize(QSize(20, 20))
+        self.addToolBar(toolbar)
+
+        reply_action = QAction(QIcon.fromTheme("mail-reply-sender", QIcon.fromTheme("go-previous")), "Reply", self)
+        reply_action.triggered.connect(self._reply)
+        toolbar.addAction(reply_action)
+
+        reply_all_action = QAction(QIcon.fromTheme("mail-reply-all"), "Reply All", self)
+        reply_all_action.triggered.connect(self._reply_all)
+        toolbar.addAction(reply_all_action)
+
+        forward_action = QAction(QIcon.fromTheme("mail-forward", QIcon.fromTheme("go-next")), "Forward", self)
+        forward_action.triggered.connect(self._forward)
+        toolbar.addAction(forward_action)
+
+        toolbar.addSeparator()
+
+        delete_action = QAction(QIcon.fromTheme("edit-delete", QIcon.fromTheme("user-trash")), "Delete", self)
+        delete_action.triggered.connect(self._delete)
+        toolbar.addAction(delete_action)
+
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
@@ -696,9 +891,25 @@ class MessageWindow(QMainWindow):
 
         if HAS_WEBENGINE:
             self.body_text = QWebEngineView()
+            # Use custom page for link safety
+            self._body_page = SafeLinkPage(self.body_text)
+            self.body_text.setPage(self._body_page)
+            # Disable JavaScript for security
+            self.body_text.settings().setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, False)
             if body_type == 'html':
-                if not body.lower().strip().startswith('<!doctype') and not body.lower().strip().startswith('<html'):
-                    body = f"<html><body>{body}</body></html>"
+                # Sanitize HTML to prevent XSS attacks
+                body = sanitize_html(body)
+                # Block remote images to prevent tracking
+                body = block_remote_images(body)
+                # Inject sans-serif font style
+                font_style = "<style>body { font-family: sans-serif; }</style>"
+                if body.lower().strip().startswith('<!doctype') or body.lower().strip().startswith('<html'):
+                    for tag in ['<head>', '<HEAD>', '<html>', '<HTML>']:
+                        if tag in body:
+                            body = body.replace(tag, tag + font_style, 1)
+                            break
+                else:
+                    body = f"<html><head>{font_style}</head><body>{body}</body></html>"
                 self.body_text.setHtml(body)
             else:
                 escaped_body = body.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('\n', '<br>')
@@ -706,21 +917,76 @@ class MessageWindow(QMainWindow):
         else:
             self.body_text = QTextEdit()
             self.body_text.setReadOnly(True)
+            self.body_text.setFont(QFont("Sans Serif", 12))
             if body_type == 'html':
+                # Sanitize HTML to prevent XSS attacks
+                body = sanitize_html(body)
+                # Block remote images to prevent tracking
+                body = block_remote_images(body)
                 self.body_text.setHtml(body)
             else:
                 self.body_text.setPlainText(body)
         layout.addWidget(self.body_text, 1)  # stretch factor = 1
 
+    def _reply(self):
+        """Reply to the message."""
+        reply_data = {
+            'from_name': self.msg_data.get('sender_name', ''),
+            'from_email': self.msg_data.get('sender_email', ''),
+            'subject': self.msg_data.get('subject', ''),
+            'date': self.msg_data.get('date_received', ''),
+            'to': self.full_data.get('to', ''),
+            'body': self.full_data.get('body', ''),
+            'reply_all': False
+        }
+        self.parent()._show_compose(reply_to=reply_data)
+        self.close()
+
+    def _reply_all(self):
+        """Reply all to the message."""
+        reply_data = {
+            'from_name': self.msg_data.get('sender_name', ''),
+            'from_email': self.msg_data.get('sender_email', ''),
+            'subject': self.msg_data.get('subject', ''),
+            'date': self.msg_data.get('date_received', ''),
+            'to': self.full_data.get('to', ''),
+            'cc': self.full_data.get('cc', ''),
+            'body': self.full_data.get('body', ''),
+            'reply_all': True
+        }
+        self.parent()._show_compose(reply_to=reply_data)
+        self.close()
+
+    def _forward(self):
+        """Forward the message."""
+        forward_data = {
+            'from_name': self.msg_data.get('sender_name', ''),
+            'from_email': self.msg_data.get('sender_email', ''),
+            'subject': self.msg_data.get('subject', ''),
+            'date': self.msg_data.get('date_received', ''),
+            'to': self.full_data.get('to', ''),
+            'body': self.full_data.get('body', '')
+        }
+        self.parent()._show_compose(forward=forward_data)
+        self.close()
+
+    def _delete(self):
+        """Delete the message."""
+        item_id = self.msg_data.get('item_id')
+        if not item_id or not self.account_id:
+            return
+
+        parent = self.parent()
+        parent.sync_manager.delete_message(
+            self.account_id,
+            item_id,
+            callback=lambda s, e: parent._on_message_deleted(s, e, item_id, -1)
+        )
+        self.close()
+
     def _apply_theme(self):
-        if self._dark_mode:
-            self.setStyleSheet("""
-                QMainWindow, QWidget { background-color: #2b2b2b; color: #a9b7c6; }
-                QTextEdit { background-color: #313335; color: #a9b7c6; border: 1px solid #3c3f41; }
-                QLabel { color: #a9b7c6; }
-            """)
-        else:
-            self.setStyleSheet("")
+        """Use system defaults."""
+        self.setStyleSheet("")
 
 
 class MailbenchWindow(QMainWindow):
@@ -739,6 +1005,10 @@ class MailbenchWindow(QMainWindow):
 
         # Initialize backend
         self.db = Database()
+        # Migrate any plaintext passwords to secure keyring storage
+        migrated = self.db.migrate_passwords_to_keyring()
+        if migrated > 0:
+            print(f"Migrated {migrated} password(s) to secure keyring storage")
         self.kerio_pool = KerioConnectionPool()
         self.sync_manager = SyncManager(self.kerio_pool, self.db, self)
 
@@ -753,9 +1023,9 @@ class MailbenchWindow(QMainWindow):
         self._current_message_full_data: Optional[dict] = None
         self._message_windows: list[MessageWindow] = []
 
-        # Theme setting (System/Light/Dark)
-        self._theme_setting = self.db.get_setting("theme", "System")
-        self._dark_mode = self._detect_dark_mode()
+        # Theme setting - always light mode for now
+        self._theme_setting = "Light"
+        self._dark_mode = False
 
         # Font size from settings
         self.font_size = int(self.db.get_setting("font_size", "12"))
@@ -782,6 +1052,11 @@ class MailbenchWindow(QMainWindow):
 
         # Load accounts
         QTimer.singleShot(100, self._load_accounts)
+
+        # Auto-refresh timer (check for new mail every 10 seconds)
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.timeout.connect(self._auto_check_mail)
+        self._refresh_timer.start(10000)  # 10 seconds
 
     @Slot(object)
     def _execute_callback(self, callback):
@@ -917,22 +1192,32 @@ class MailbenchWindow(QMainWindow):
         self._reply_all_action.setToolTip("Reply to all (Ctrl+Shift+R)")
         toolbar.addAction(self._reply_all_action)
 
-        forward_action = QAction(QIcon.fromTheme("mail-forward", QIcon.fromTheme("go-next")), "Forward", self)
-        forward_action.triggered.connect(self._forward)
-        forward_action.setToolTip("Forward message (Ctrl+Shift+F)")
-        toolbar.addAction(forward_action)
+        self._forward_action = QAction(QIcon.fromTheme("mail-forward", QIcon.fromTheme("go-next")), "Forward", self)
+        self._forward_action.triggered.connect(self._forward)
+        self._forward_action.setToolTip("Forward message (Ctrl+Shift+F)")
+        toolbar.addAction(self._forward_action)
 
         toolbar.addSeparator()
 
-        delete_action = QAction(QIcon.fromTheme("edit-delete", QIcon.fromTheme("user-trash")), "Delete", self)
-        delete_action.triggered.connect(self._delete_messages)
-        delete_action.setToolTip("Delete selected messages (Delete)")
-        toolbar.addAction(delete_action)
+        self._delete_action = QAction(QIcon.fromTheme("edit-delete", QIcon.fromTheme("user-trash")), "Delete", self)
+        self._delete_action.triggered.connect(self._delete_messages)
+        self._delete_action.setToolTip("Delete selected messages (Delete)")
+        toolbar.addAction(self._delete_action)
 
         refresh_action = QAction(QIcon.fromTheme("view-refresh", QIcon.fromTheme("sync")), "Refresh", self)
         refresh_action.triggered.connect(self._check_mail)
         refresh_action.setToolTip("Check for new mail (F5)")
         toolbar.addAction(refresh_action)
+
+        # Initially disable message actions (no message selected)
+        self._update_message_actions(False)
+
+    def _update_message_actions(self, enabled: bool):
+        """Enable or disable message-related toolbar actions."""
+        self._reply_action.setEnabled(enabled)
+        self._reply_all_action.setEnabled(enabled)
+        self._forward_action.setEnabled(enabled)
+        self._delete_action.setEnabled(enabled)
 
     def _create_main_layout(self):
         """Create the 3-pane layout."""
@@ -967,6 +1252,9 @@ class MailbenchWindow(QMainWindow):
         self._folder_tree.setAcceptDrops(True)
         self._folder_tree.setDropIndicatorShown(True)
         self._folder_tree.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+        # Context menu for folder operations
+        self._folder_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._folder_tree.customContextMenuRequested.connect(self._show_folder_context_menu)
         folder_layout.addWidget(self._folder_tree)
 
         self._splitter.addWidget(folder_widget)
@@ -992,7 +1280,7 @@ class MailbenchWindow(QMainWindow):
 
         # Message list
         self._message_model = MessageListModel()
-        self._message_delegate = MessageDelegate(dark_mode=self._dark_mode, font_size=self.font_size)
+        self._message_delegate = MessageDelegate(dark_mode=False, font_size=self.font_size)
         self._message_delegate.flagClicked.connect(self._on_flag_clicked)
 
         self._message_list = QListView()
@@ -1029,9 +1317,23 @@ class MailbenchWindow(QMainWindow):
         header_layout.setContentsMargins(0, 0, 0, 5)
         header_layout.setSpacing(2)
 
+        # From line with inline verification indicator
+        from_layout = QHBoxLayout()
+        from_layout.setContentsMargins(0, 0, 0, 0)
+        from_layout.setSpacing(6)
+
         self._preview_from = QLabel("From:")
         self._preview_from.setStyleSheet("font-weight: bold;")
-        header_layout.addWidget(self._preview_from)
+        from_layout.addWidget(self._preview_from)
+
+        # Sender verification indicator (inline, hidden by default)
+        self._sender_verification = QLabel("")
+        self._sender_verification.setStyleSheet("font-size: 11px;")
+        self._sender_verification.hide()
+        from_layout.addWidget(self._sender_verification)
+
+        from_layout.addStretch()
+        header_layout.addLayout(from_layout)
 
         self._preview_to = QLabel("To:")
         header_layout.addWidget(self._preview_to)
@@ -1059,14 +1361,67 @@ class MailbenchWindow(QMainWindow):
         self._preview_separator.setObjectName("previewSeparator")
         preview_layout.addWidget(self._preview_separator)
 
+        # Images blocked banner (hidden by default)
+        self._images_banner = QWidget()
+        banner_layout = QHBoxLayout(self._images_banner)
+        banner_layout.setContentsMargins(8, 6, 8, 6)
+        banner_layout.setSpacing(6)
+
+        banner_label = QLabel("Images blocked.")
+        banner_label.setStyleSheet("color: #856404; font-weight: 500;")
+        banner_layout.addWidget(banner_label)
+
+        # Modern link-style buttons
+        link_style = """
+            QPushButton {
+                background: none;
+                border: none;
+                color: #0066cc;
+                text-decoration: underline;
+                padding: 0 4px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                color: #004499;
+            }
+        """
+
+        self._load_images_btn = QPushButton("Load images")
+        self._load_images_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._load_images_btn.setStyleSheet(link_style)
+        self._load_images_btn.clicked.connect(self._load_images_once)
+        banner_layout.addWidget(self._load_images_btn)
+
+        self._trust_sender_btn = QPushButton("")
+        self._trust_sender_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._trust_sender_btn.setStyleSheet(link_style)
+        self._trust_sender_btn.clicked.connect(self._trust_sender)
+        banner_layout.addWidget(self._trust_sender_btn)
+
+        banner_layout.addStretch()
+        self._images_banner.setStyleSheet("background-color: #fff3cd; border: 1px solid #ffc107; border-radius: 4px;")
+        self._images_banner.hide()
+        preview_layout.addWidget(self._images_banner)
+
+        # Track current message data for image loading
+        self._current_sender_email: Optional[str] = None
+        self._current_body_html: Optional[str] = None
+        self._images_blocked: bool = False
+
         # Preview body - use WebEngine if available for proper HTML/image support
         if HAS_WEBENGINE:
             self._preview_body = QWebEngineView()
+            # Use custom page for link safety
+            self._preview_page = SafeLinkPage(self._preview_body)
+            self._preview_body.setPage(self._preview_page)
+            # Disable JavaScript for security
+            self._preview_body.settings().setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, False)
             self._preview_body.setHtml("<html><body></body></html>")
             self._use_webengine = True
         else:
             self._preview_body = QTextEdit()
             self._preview_body.setReadOnly(True)
+            self._preview_body.setFont(QFont("Sans Serif", 12))
             self._use_webengine = False
 
         # Body takes remaining space
@@ -1094,51 +1449,35 @@ class MailbenchWindow(QMainWindow):
         self._statusbar.showMessage("Ready")
 
     def _apply_theme(self):
-        """Apply dark or light theme."""
-        if self._dark_mode:
-            self.setStyleSheet("""
-                QMainWindow, QWidget { background-color: #2b2b2b; color: #a9b7c6; }
-                QTreeView, QListView, QTextEdit { background-color: #313335; color: #a9b7c6; border: 1px solid #3c3f41; }
-                QTreeView::item { padding: 4px 2px; }
-                QTreeView::item:selected, QListView::item:selected { background-color: #214283; }
-                QTreeView::item:hover:!selected { background-color: #3c3f41; }
-                QTreeView::branch { background-color: #313335; }
-                QLineEdit { background-color: #313335; color: #a9b7c6; border: 1px solid #3c3f41; padding: 4px; }
-                QToolBar { background-color: #2b2b2b; border: none; border-bottom: 1px solid #3c3f41; padding: 4px; spacing: 2px; }
-                QToolBar QToolButton { background-color: transparent; color: #a9b7c6; padding: 6px 12px; border: none; border-radius: 4px; }
-                QToolBar QToolButton:hover { background-color: #3c3f41; }
-                QToolBar QToolButton:pressed { background-color: #4c5052; }
-                QToolBar::separator { background-color: #3c3f41; width: 1px; margin: 4px 8px; }
-                QMenuBar { background-color: #2b2b2b; color: #a9b7c6; }
-                QMenuBar::item:selected { background-color: #214283; }
-                QMenu { background-color: #2b2b2b; color: #a9b7c6; border: 1px solid #3c3f41; }
-                QMenu::item:selected { background-color: #214283; }
-                QStatusBar { background-color: #2b2b2b; color: #a9b7c6; }
-                QSplitter::handle { background-color: #3c3f41; }
-                QLabel { color: #a9b7c6; }
-                QPushButton { background-color: #3c3f41; color: #a9b7c6; padding: 5px 10px; border: none; }
-                QPushButton:hover { background-color: #4c5052; }
-                QFrame#previewSeparator { background-color: #505050; }
-            """)
-        else:
-            self.setStyleSheet("""
-                QMainWindow, QWidget { background-color: #f0f0f0; color: #000000; }
-                QTreeView, QListView, QTextEdit { background-color: #ffffff; color: #000000; border: 1px solid #c0c0c0; }
-                QTreeView::item { padding: 4px 2px; }
-                QTreeView::item:selected, QListView::item:selected { background-color: #0078d4; color: white; }
-                QTreeView::item:hover:!selected { background-color: #e8e8e8; }
-                QLineEdit { background-color: #ffffff; color: #000000; border: 1px solid #c0c0c0; padding: 4px; }
-                QToolBar { background-color: #f5f5f5; border: none; border-bottom: 1px solid #d0d0d0; padding: 4px; spacing: 2px; }
-                QToolBar QToolButton { background-color: transparent; color: #333333; padding: 6px 12px; border: none; border-radius: 4px; }
-                QToolBar QToolButton:hover { background-color: #e0e0e0; }
-                QToolBar QToolButton:pressed { background-color: #d0d0d0; }
-                QToolBar::separator { background-color: #d0d0d0; width: 1px; margin: 4px 8px; }
-                QSplitter::handle { background-color: #c0c0c0; }
-                QFrame#previewSeparator { background-color: #c0c0c0; }
-            """)
+        """Apply theme - force light mode."""
+        app = QApplication.instance()
 
-        # Update delegate
-        self._message_delegate.set_dark_mode(self._dark_mode)
+        # Create explicit light palette
+        palette = QPalette()
+        palette.setColor(QPalette.ColorRole.Window, QColor("#f0f0f0"))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor("#000000"))
+        palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
+        palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#f7f7f7"))
+        palette.setColor(QPalette.ColorRole.Text, QColor("#000000"))
+        palette.setColor(QPalette.ColorRole.Button, QColor("#f0f0f0"))
+        palette.setColor(QPalette.ColorRole.ButtonText, QColor("#000000"))
+        palette.setColor(QPalette.ColorRole.BrightText, QColor("#ffffff"))
+        palette.setColor(QPalette.ColorRole.Highlight, QColor("#0078d4"))
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+        palette.setColor(QPalette.ColorRole.Link, QColor("#0066cc"))
+        palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#808080"))
+        palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#ffffdc"))
+        palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#000000"))
+        # Disabled colors
+        palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor("#808080"))
+        palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor("#808080"))
+        palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor("#808080"))
+        app.setPalette(palette)
+
+        self.setStyleSheet("")
+
+        # Delegate always uses light mode
+        self._message_delegate.set_dark_mode(False)
         self._message_list.viewport().update()
 
     def _apply_font_size(self):
@@ -1191,9 +1530,8 @@ class MailbenchWindow(QMainWindow):
         if HAS_WEBENGINE and isinstance(self._preview_body, QWebEngineView):
             self._preview_body.setZoomFactor(zoom_factor)
         else:
-            # For QTextEdit, scale font
-            font = self._preview_body.font()
-            font.setPointSize(int(12 * zoom_factor))
+            # For QTextEdit, scale font (preserve sans-serif)
+            font = QFont("Sans Serif", int(12 * zoom_factor))
             self._preview_body.setFont(font)
 
         # Apply to compose widget if open
@@ -1220,10 +1558,10 @@ class MailbenchWindow(QMainWindow):
             return False
 
     def _apply_theme_setting(self, theme: str):
-        """Apply a theme setting (System/Light/Dark)."""
-        self._theme_setting = theme
-        self._dark_mode = self._detect_dark_mode()
-        self._dark_mode_action.setChecked(self._dark_mode)
+        """Apply a theme setting - light mode only for now."""
+        self._theme_setting = "Light"
+        self._dark_mode = False
+        self._dark_mode_action.setChecked(False)
         self._apply_theme()
 
     def _toggle_dark_mode(self):
@@ -1300,9 +1638,36 @@ class MailbenchWindow(QMainWindow):
             self._load_folders(account_id)
             self._load_address_book(account_id)
             self._load_signature(account_id)
+            # Start listening for mailbox changes (push notifications)
+            self.sync_manager.start_change_listener(
+                account_id,
+                callback=lambda aid, changes: self._on_mailbox_changes(aid, changes)
+            )
         else:
             self._statusbar.showMessage(f"Connection failed: {error}")
             QMessageBox.warning(self, "Connection Failed", str(error))
+
+    def _on_mailbox_changes(self, account_id: int, changes: list):
+        """Handle mailbox changes from server push."""
+        if not changes:
+            return
+
+        # Check if any changes are for the current folder
+        needs_refresh = False
+        for change in changes:
+            change_type = change.get("type", "")
+            folder_id = change.get("folderId", "")
+
+            # Refresh if changes affect current folder or if it's a general mail change
+            if change_type in ("mtMail", "mtFolder"):
+                if folder_id == self._current_folder_id or not folder_id:
+                    needs_refresh = True
+                    break
+
+        if needs_refresh and self._current_account_id == account_id:
+            # Refresh the current folder
+            self._statusbar.showMessage("New mail received...")
+            self._load_messages(account_id, self._current_folder_id)
 
     def _load_address_book(self, account_id: int):
         """Load contacts and users for email autocomplete."""
@@ -1504,6 +1869,20 @@ class MailbenchWindow(QMainWindow):
         self._messages_by_id.clear()
         self._filter_entry.clear()
 
+        # Clear preview pane and current message state
+        self._preview_from.setText("")
+        self._preview_to.setText("")
+        self._preview_subject.setText("")
+        self._preview_date.setText("")
+        self._clear_attachments_display()
+        if self._use_webengine:
+            self._preview_body.setHtml("<html><body></body></html>")
+        else:
+            self._preview_body.clear()
+        self._current_message_id = None
+        self._current_message_full_data = None
+        self._update_message_actions(False)
+
         if account_id not in self.connected_accounts:
             # Show cached messages
             messages = self.db.get_messages(account_id, folder_id, limit=50)
@@ -1559,6 +1938,7 @@ class MailbenchWindow(QMainWindow):
             return
 
         self._current_message_id = msg.item_id
+        self._update_message_actions(True)
         self._show_message_preview(msg)
 
         # Fetch full body
@@ -1578,9 +1958,70 @@ class MailbenchWindow(QMainWindow):
         msg_data = self._messages_by_id.get(msg.item_id, {})
         full_data = self._current_message_full_data if msg.item_id == self._current_message_id else {}
 
-        win = MessageWindow(self, msg_data, full_data, self._dark_mode)
+        win = MessageWindow(self, msg_data, full_data, False, self._current_account_id)
         win.show()
         self._message_windows.append(win)
+
+    def _update_sender_verification(self, sender_email: str, sender_name: str):
+        """Update sender verification indicator based on sender analysis.
+
+        Only shows warnings - known contacts don't need an indicator.
+        """
+        if not sender_email:
+            self._sender_verification.hide()
+            return
+
+        sender_email_lower = sender_email.lower()
+        is_known = False
+        is_external = False
+        is_suspicious = False
+        suspicious_reason = ""
+
+        # Check if sender is in address book
+        if self._address_book:
+            for contact in self._address_book:
+                if contact.get('email', '').lower() == sender_email_lower:
+                    is_known = True
+                    break
+
+        # Check if sender domain is external (different from user's domain)
+        if self._current_account_id:
+            for acc in self.db.get_accounts():
+                if acc['id'] == self._current_account_id:
+                    user_email = acc.get('email', '')
+                    if '@' in user_email and '@' in sender_email:
+                        user_domain = user_email.split('@')[1].lower()
+                        sender_domain = sender_email.split('@')[1].lower()
+                        if user_domain != sender_domain:
+                            is_external = True
+                    break
+
+        # Check for suspicious display name (name looks like email but doesn't match)
+        if sender_name and '@' in sender_name:
+            name_email = sender_name.lower()
+            if sender_email_lower not in name_email:
+                is_suspicious = True
+                suspicious_reason = "Display name contains a different email address - possible spoofing attempt"
+
+        # Build indicator - only show warnings, not positive indicators
+        if is_suspicious:
+            # Red yield sign for suspicious sender
+            self._sender_verification.setText("⚠")
+            self._sender_verification.setToolTip(suspicious_reason)
+            self._sender_verification.setStyleSheet("font-size: 14px; color: #cc0000;")
+            self._sender_verification.setCursor(Qt.CursorShape.WhatsThisCursor)
+            self._sender_verification.show()
+        elif is_external and not is_known:
+            # Yellow yield sign for unknown external sender
+            self._sender_verification.setText("⚠")
+            self._sender_verification.setToolTip("External sender - not from your organization")
+            self._sender_verification.setStyleSheet("font-size: 14px; color: #cc8800;")
+            self._sender_verification.setCursor(Qt.CursorShape.WhatsThisCursor)
+            self._sender_verification.show()
+        else:
+            # Known contact or internal sender - no indicator needed
+            self._sender_verification.hide()
+            self._sender_verification.setToolTip("")
 
     def _show_message_preview(self, msg: MessageData):
         """Show message in preview pane."""
@@ -1591,6 +2032,15 @@ class MailbenchWindow(QMainWindow):
         self._preview_to.setText("To: Loading...")
         self._preview_subject.setText(msg.subject)
         self._preview_date.setText(msg.date_display)
+
+        # Update sender verification indicator
+        self._update_sender_verification(msg.sender_email, msg.sender_name)
+
+        # Store sender email for image loading banner
+        self._current_sender_email = msg.sender_email
+
+        # Hide images banner while loading
+        self._images_banner.hide()
 
         # Show loading message
         if self._use_webengine:
@@ -1632,12 +2082,34 @@ class MailbenchWindow(QMainWindow):
         body = data.get('body', '')
         body_type = data.get('body_type', 'text')
 
+        # Track body for image loading (sender_email set in _show_message_preview)
+        self._current_body_html = body if body_type == 'html' else None
+        self._images_blocked = False
+
+        # Check if sender is trusted for remote images
+        sender_trusted = self.db.is_trusted_sender(self._current_sender_email) if self._current_sender_email else False
+
         if self._use_webengine:
             # WebEngineView handles HTML natively
             if body_type == 'html':
-                # Wrap in proper HTML structure if needed
-                if not body.lower().strip().startswith('<!doctype') and not body.lower().strip().startswith('<html'):
-                    body = f"<html><body>{body}</body></html>"
+                # Sanitize HTML to prevent XSS attacks
+                body = sanitize_html(body)
+                # Block remote images unless sender is trusted
+                if not sender_trusted:
+                    original_body = body
+                    body = block_remote_images(body)
+                    # Check if any images were actually blocked
+                    self._images_blocked = (body != original_body)
+                # Inject sans-serif font style
+                font_style = "<style>body { font-family: sans-serif; }</style>"
+                if body.lower().strip().startswith('<!doctype') or body.lower().strip().startswith('<html'):
+                    # Insert style after <head> or <html> tag
+                    for tag in ['<head>', '<HEAD>', '<html>', '<HTML>']:
+                        if tag in body:
+                            body = body.replace(tag, tag + font_style, 1)
+                            break
+                else:
+                    body = f"<html><head>{font_style}</head><body>{body}</body></html>"
                 self._preview_body.setHtml(body)
             else:
                 # Convert plain text to HTML
@@ -1646,14 +2118,69 @@ class MailbenchWindow(QMainWindow):
         else:
             # QTextEdit fallback
             if body_type == 'html':
+                # Sanitize HTML to prevent XSS attacks
+                body = sanitize_html(body)
+                # Block remote images unless sender is trusted
+                if not sender_trusted:
+                    original_body = body
+                    body = block_remote_images(body)
+                    self._images_blocked = (body != original_body)
                 self._preview_body.setHtml(body)
             else:
                 self._preview_body.setPlainText(body)
 
-        # Mark as read
+        # Show/hide images blocked banner
+        if self._images_blocked:
+            self._trust_sender_btn.setText(f"Always Load from {self._current_sender_email}")
+            self._images_banner.show()
+        else:
+            self._images_banner.hide()
+
+        # Mark as read (locally and on server)
         item_id = data.get('item_id')
-        if item_id:
+        if item_id and self._current_account_id:
             self._message_model.update_message(item_id, is_read=True)
+            # Sync to server
+            self.sync_manager.mark_as_read(
+                self._current_account_id, item_id, True,
+                callback=lambda s, e: None  # Silent callback
+            )
+            # Update in local cache
+            if item_id in self._messages_by_id:
+                self._messages_by_id[item_id]['is_read'] = True
+
+    def _load_images_once(self):
+        """Load remote images for current message only."""
+        if not self._current_body_html:
+            return
+
+        # Re-render with images (sanitize but don't block)
+        body = sanitize_html(self._current_body_html)
+
+        if self._use_webengine:
+            font_style = "<style>body { font-family: sans-serif; }</style>"
+            if body.lower().strip().startswith('<!doctype') or body.lower().strip().startswith('<html'):
+                for tag in ['<head>', '<HEAD>', '<html>', '<HTML>']:
+                    if tag in body:
+                        body = body.replace(tag, tag + font_style, 1)
+                        break
+            else:
+                body = f"<html><head>{font_style}</head><body>{body}</body></html>"
+            self._preview_body.setHtml(body)
+        else:
+            self._preview_body.setHtml(body)
+
+        self._images_banner.hide()
+        self._images_blocked = False
+
+    def _trust_sender(self):
+        """Add current sender to trusted list and load images."""
+        if not self._current_sender_email:
+            return
+
+        self.db.add_trusted_sender(self._current_sender_email)
+        self._statusbar.showMessage(f"Added {self._current_sender_email} to trusted senders")
+        self._load_images_once()
 
     def _clear_attachments_display(self):
         """Clear attachments display."""
@@ -1662,31 +2189,281 @@ class MailbenchWindow(QMainWindow):
             if child.widget():
                 child.widget().deleteLater()
 
+    def _get_file_icon(self, filename: str) -> str:
+        """Get an icon character based on file extension."""
+        ext = os.path.splitext(filename.lower())[1]
+        if ext in {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg'}:
+            return "🖼"
+        elif ext in {'.pdf'}:
+            return "📄"
+        elif ext in {'.doc', '.docx', '.odt', '.rtf'}:
+            return "📝"
+        elif ext in {'.xls', '.xlsx', '.ods', '.csv'}:
+            return "📊"
+        elif ext in {'.ppt', '.pptx', '.odp'}:
+            return "📽"
+        elif ext in {'.zip', '.rar', '.7z', '.tar', '.gz'}:
+            return "📦"
+        elif ext in {'.mp3', '.wav', '.ogg', '.flac', '.m4a'}:
+            return "🎵"
+        elif ext in {'.mp4', '.avi', '.mkv', '.mov', '.webm'}:
+            return "🎬"
+        elif ext in {'.txt', '.log'}:
+            return "📃"
+        elif ext in {'.exe', '.msi', '.bat', '.cmd'}:
+            return "⚙"
+        else:
+            return "📎"
+
+    def _format_file_size(self, size_bytes: int) -> str:
+        """Format file size in human-readable form."""
+        if size_bytes < 1024:
+            return f"{size_bytes} B"
+        elif size_bytes < 1024 * 1024:
+            return f"{size_bytes / 1024:.1f} KB"
+        else:
+            return f"{size_bytes / (1024 * 1024):.1f} MB"
+
     def _show_attachments(self, attachments: list):
-        """Show attachments in preview header."""
+        """Show attachments in preview header with card-style display."""
         self._clear_attachments_display()
 
         if not attachments:
             return
 
-        self._attachments_layout.addWidget(QLabel("Attachments:"))
+        is_dark = self.db.get_setting("dark_mode", "0") == "1"
+
+        # Header
+        count = len(attachments)
+        header = QLabel(f"{count} Attachment{'s' if count > 1 else ''}")
+        header_color = "#999" if is_dark else "#666"
+        header.setStyleSheet(f"font-weight: bold; color: {header_color};")
+        self._attachments_layout.addWidget(header)
+
+        # Cards container
+        cards_widget = QWidget()
+        cards_layout = QHBoxLayout(cards_widget)
+        cards_layout.setContentsMargins(0, 0, 0, 0)
+        cards_layout.setSpacing(10)
 
         for att in attachments:
-            name = att.get('name', 'attachment')
-            size = att.get('size', 0)
+            card = self._create_preview_attachment_card(att, is_dark)
+            cards_layout.addWidget(card)
 
-            if size >= 1024 * 1024:
-                size_str = f"({size / (1024 * 1024):.1f} MB)"
-            elif size >= 1024:
-                size_str = f"({size / 1024:.1f} KB)"
-            else:
-                size_str = f"({size} B)" if size else ""
+        cards_layout.addStretch()
+        self._attachments_layout.addWidget(cards_widget)
 
-            btn = QPushButton(f"📎 {name} {size_str}")
-            btn.clicked.connect(lambda checked, a=att: self._download_attachment(a))
-            self._attachments_layout.addWidget(btn)
+    def _create_preview_attachment_card(self, attachment: dict, is_dark: bool) -> QWidget:
+        """Create a card widget for an attachment in preview pane."""
+        card = QFrame()
+        card.setFrameShape(QFrame.Shape.NoFrame)
+        card.setObjectName("attachCard")
 
-        self._attachments_layout.addStretch()
+        if is_dark:
+            card.setStyleSheet("""
+                QFrame#attachCard {
+                    background-color: #3c3f41;
+                    border: 1px solid #555;
+                    border-radius: 4px;
+                }
+                QFrame#attachCard:hover {
+                    background-color: #4c5052;
+                    border: 1px solid #666;
+                }
+            """)
+        else:
+            card.setStyleSheet("""
+                QFrame#attachCard {
+                    background-color: #f5f5f5;
+                    border: 1px solid #ddd;
+                    border-radius: 4px;
+                }
+                QFrame#attachCard:hover {
+                    background-color: #e8e8e8;
+                    border: 1px solid #ccc;
+                }
+            """)
+
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(8, 5, 8, 5)
+        layout.setSpacing(8)
+
+        # Icon
+        name = attachment.get('name', 'attachment')
+        icon_label = QLabel(self._get_file_icon(name))
+        icon_label.setStyleSheet("font-size: 24px; background: transparent; border: none;")
+        layout.addWidget(icon_label)
+
+        # Name and size
+        info_widget = QWidget()
+        info_widget.setStyleSheet("background: transparent; border: none;")
+        info_layout = QVBoxLayout(info_widget)
+        info_layout.setContentsMargins(0, 0, 0, 0)
+        info_layout.setSpacing(0)
+
+        # Truncate long names
+        display_name = name
+        if len(display_name) > 25:
+            display_name = display_name[:22] + "..."
+
+        name_label = QLabel(display_name)
+        name_label.setStyleSheet("font-weight: 500; background: transparent; border: none;")
+        name_label.setToolTip(name)
+        info_layout.addWidget(name_label)
+
+        # Size
+        size = attachment.get('size', 0)
+        size_label = QLabel(self._format_file_size(size))
+        size_color = "#777" if is_dark else "#888"
+        size_label.setStyleSheet(f"color: {size_color}; font-size: 11px; background: transparent; border: none;")
+        info_layout.addWidget(size_label)
+
+        layout.addWidget(info_widget)
+
+        # Menu button with dropdown
+        menu_btn = QToolButton()
+        menu_btn.setText("▼")
+        menu_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu_btn.setFixedSize(24, 24)
+
+        btn_style = f"""
+            QToolButton {{
+                background: transparent;
+                border: none;
+                font-size: 10px;
+                color: {'#888' if is_dark else '#666'};
+            }}
+            QToolButton:hover {{
+                background-color: {'#4c5052' if is_dark else '#ddd'};
+                border-radius: 4px;
+            }}
+            QToolButton::menu-indicator {{
+                image: none;
+            }}
+        """
+        menu_btn.setStyleSheet(btn_style)
+
+        menu = QMenu(menu_btn)
+
+        # For preview, offer Open and Save
+        open_action = menu.addAction("📂 Open")
+        open_action.triggered.connect(lambda checked, a=attachment: self._open_attachment_direct(a))
+
+        save_action = menu.addAction("💾 Save As...")
+        save_action.triggered.connect(lambda checked, a=attachment: self._save_attachment_direct(a))
+
+        menu_btn.setMenu(menu)
+        layout.addWidget(menu_btn)
+
+        return card
+
+    def _open_attachment_direct(self, attachment: dict):
+        """Open attachment directly without prompting."""
+        name = attachment.get('name', 'attachment')
+        url = attachment.get('url', '')
+
+        if not url or not self._current_account_id:
+            return
+
+        session = self.kerio_pool.get_session(self._current_account_id)
+        if not session:
+            return
+
+        # Check for dangerous file types
+        is_dangerous, warning = self._get_attachment_warning(name)
+        if is_dangerous:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Security Warning")
+            msg.setIcon(QMessageBox.Icon.Warning)
+            msg.setText(f"Warning: {name}")
+            msg.setInformativeText(f"{warning}\n\nDo you want to continue?")
+            msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            msg.setDefaultButton(QMessageBox.StandardButton.No)
+            if msg.exec() != QMessageBox.StandardButton.Yes:
+                return
+
+        full_url = f"https://{session.config.server}{url}"
+        self._open_attachment(full_url, name, session)
+
+    def _get_default_downloads_dir(self) -> str:
+        """Get the default downloads directory from settings or OS default."""
+        # Check saved setting first
+        saved_dir = self.db.get_setting("default_save_directory", "")
+        if saved_dir and os.path.isdir(saved_dir):
+            return saved_dir
+
+        # Fall back to OS-appropriate default
+        system = platform.system()
+        if system == "Darwin":
+            return os.path.join(os.path.expanduser("~"), "Downloads")
+        elif system == "Windows":
+            return os.path.join(os.path.expanduser("~"), "Downloads")
+        else:
+            # Linux - try XDG
+            try:
+                result = subprocess.run(
+                    ["xdg-user-dir", "DOWNLOAD"],
+                    capture_output=True, text=True, timeout=2
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    path = result.stdout.strip()
+                    if os.path.isdir(path):
+                        return path
+            except Exception:
+                pass
+            return os.path.join(os.path.expanduser("~"), "Downloads")
+
+    def _save_attachment_direct(self, attachment: dict):
+        """Save attachment directly without prompting."""
+        name = attachment.get('name', 'attachment')
+        url = attachment.get('url', '')
+
+        if not url or not self._current_account_id:
+            return
+
+        session = self.kerio_pool.get_session(self._current_account_id)
+        if not session:
+            return
+
+        # Use default downloads directory
+        default_dir = self._get_default_downloads_dir()
+        default_path = os.path.join(default_dir, name)
+
+        save_path, _ = QFileDialog.getSaveFileName(self, "Save Attachment", default_path)
+        if save_path:
+            full_url = f"https://{session.config.server}{url}"
+            self._save_attachment(full_url, save_path, session)
+
+    def _get_attachment_warning(self, filename: str) -> tuple[bool, str]:
+        """Check if attachment is potentially dangerous and return warning message.
+
+        Returns (is_dangerous, warning_message).
+        """
+        _, ext = os.path.splitext(filename.lower())
+
+        # Executable extensions - very dangerous
+        executables = {'.exe', '.msi', '.bat', '.cmd', '.com', '.scr', '.pif'}
+        # Script extensions - dangerous
+        scripts = {'.js', '.vbs', '.vbe', '.jse', '.wsf', '.wsh', '.ps1', '.psm1'}
+        # Office macros - potentially dangerous
+        office_macros = {'.docm', '.xlsm', '.pptm', '.dotm', '.xltm', '.potm'}
+        # Archives that can hide malware
+        archives = {'.zip', '.rar', '.7z', '.tar', '.gz', '.iso', '.img'}
+        # Other potentially dangerous
+        other_risky = {'.jar', '.hta', '.cpl', '.msc', '.lnk', '.reg', '.dll'}
+
+        if ext in executables:
+            return (True, f"This is an executable file ({ext}). Executable files can harm your computer if they contain malware. Only open if you trust the sender and were expecting this file.")
+        elif ext in scripts:
+            return (True, f"This is a script file ({ext}). Script files can run code on your computer. Only open if you trust the sender and were expecting this file.")
+        elif ext in office_macros:
+            return (True, f"This Office file ({ext}) may contain macros. Macros can run code on your computer. Only open if you trust the sender.")
+        elif ext in archives:
+            return (False, f"This is an archive file ({ext}). Archives can contain hidden executable files. Scan the contents before opening any files inside.")
+        elif ext in other_risky:
+            return (True, f"This file type ({ext}) can be used to install software or change settings. Only open if you trust the sender.")
+
+        return (False, "")
 
     def _download_attachment(self, attachment: dict):
         """Download an attachment."""
@@ -1705,6 +2482,31 @@ class MailbenchWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "Account not connected")
             return
 
+        # Check for dangerous file types
+        is_dangerous, warning = self._get_attachment_warning(name)
+
+        if is_dangerous:
+            # Show warning for dangerous files
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Security Warning")
+            msg.setIcon(QMessageBox.Icon.Warning)
+            msg.setText(f"Warning: {name}")
+            msg.setInformativeText(f"{warning}\n\nDo you want to continue?")
+            msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            msg.setDefaultButton(QMessageBox.StandardButton.No)
+
+            if msg.exec() != QMessageBox.StandardButton.Yes:
+                return
+        elif warning:
+            # Show info for files that need caution (archives)
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Caution")
+            msg.setIcon(QMessageBox.Icon.Information)
+            msg.setText(f"Note: {name}")
+            msg.setInformativeText(warning)
+            msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+            msg.exec()
+
         # Ask user what to do
         result = QMessageBox.question(
             self, "Download Attachment",
@@ -1717,7 +2519,9 @@ class MailbenchWindow(QMainWindow):
         if result == QMessageBox.StandardButton.Open:
             self._open_attachment(full_url, name, session)
         elif result == QMessageBox.StandardButton.Save:
-            save_path, _ = QFileDialog.getSaveFileName(self, "Save Attachment", name)
+            default_dir = self._get_default_downloads_dir()
+            default_path = os.path.join(default_dir, name)
+            save_path, _ = QFileDialog.getSaveFileName(self, "Save Attachment", default_path)
             if save_path:
                 self._save_attachment(full_url, save_path, session)
 
@@ -1729,7 +2533,7 @@ class MailbenchWindow(QMainWindow):
                 cookies = {session.cookie_name: session.cookie_value} if hasattr(session, 'cookie_name') else {}
                 headers = {"X-Token": session.token} if hasattr(session, 'token') else {}
 
-                response = requests.get(url, cookies=cookies, headers=headers, verify=False, timeout=60)
+                response = requests.get(url, cookies=cookies, headers=headers, verify=True, timeout=60)
                 response.raise_for_status()
 
                 _, ext = os.path.splitext(filename)
@@ -1760,7 +2564,7 @@ class MailbenchWindow(QMainWindow):
                 cookies = {session.cookie_name: session.cookie_value} if hasattr(session, 'cookie_name') else {}
                 headers = {"X-Token": session.token} if hasattr(session, 'token') else {}
 
-                response = requests.get(url, cookies=cookies, headers=headers, verify=False, timeout=60)
+                response = requests.get(url, cookies=cookies, headers=headers, verify=True, timeout=60)
                 response.raise_for_status()
 
                 with open(save_path, 'wb') as f:
@@ -1838,6 +2642,77 @@ class MailbenchWindow(QMainWindow):
         delete_action.triggered.connect(self._delete_messages)
 
         menu.exec_(self._message_list.mapToGlobal(position))
+
+    def _show_folder_context_menu(self, position):
+        """Show context menu for folder tree."""
+        index = self._folder_tree.indexAt(position)
+        if not index.isValid():
+            return
+
+        item = self._folder_model.itemFromIndex(index)
+        if not item:
+            return
+
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not data or data[0] != "folder":
+            return
+
+        account_id = data[1]
+        folder_id = data[2]
+        folder_name = item.text().lower()
+
+        # Check if this is a trash/deleted folder
+        is_trash = 'trash' in folder_name or 'deleted' in folder_name
+
+        if not is_trash:
+            return  # No context menu for non-trash folders (for now)
+
+        menu = QMenu(self)
+        empty_action = menu.addAction("Empty Trash")
+        empty_action.triggered.connect(lambda: self._empty_trash(account_id, folder_id))
+        menu.exec_(self._folder_tree.mapToGlobal(position))
+
+    def _empty_trash(self, account_id: int, folder_id: str):
+        """Empty the trash folder - permanently delete all messages."""
+        # Confirm with user
+        result = QMessageBox.warning(
+            self,
+            "Empty Trash",
+            "Permanently delete all messages in Trash?\n\nThis action cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+
+        if result != QMessageBox.StandardButton.Yes:
+            return
+
+        self._statusbar.showMessage("Emptying trash...")
+
+        def on_empty_complete(success: bool, error: str, count: int):
+            if success:
+                self._statusbar.showMessage(f"Deleted {count} messages from trash")
+                # Refresh the folder if we're viewing it
+                if self._current_folder_id == folder_id:
+                    self._message_model.clear()
+                    self._current_message_id = None
+                    self._clear_preview()
+            else:
+                self._statusbar.showMessage(f"Failed to empty trash: {error}")
+                QMessageBox.warning(self, "Error", f"Failed to empty trash: {error}")
+
+        self.sync_manager.empty_trash(account_id, folder_id, callback=on_empty_complete)
+
+    def _clear_preview(self):
+        """Clear the message preview pane."""
+        self._preview_from.setText("From:")
+        self._sender_verification.hide()
+        self._preview_to.setText("To:")
+        self._preview_subject.setText("")
+        self._preview_date.setText("")
+        if self._use_webengine:
+            self._preview_body.setHtml("<html><body></body></html>")
+        else:
+            self._preview_body.setText("")
 
     def _mark_messages(self, is_read: bool):
         """Mark selected messages as read/unread."""
@@ -2077,9 +2952,67 @@ class MailbenchWindow(QMainWindow):
             self._statusbar.showMessage(f"Delete failed: {error}")
 
     def _check_mail(self):
-        """Refresh current folder."""
+        """Refresh current folder (full refresh, clears preview)."""
         if self._current_account_id and self._current_folder_id:
             self._load_messages(self._current_account_id, self._current_folder_id)
+
+    def _auto_check_mail(self):
+        """Auto-refresh: update message list without disrupting current view."""
+        if not self._current_account_id or not self._current_folder_id:
+            return
+        if self._current_account_id not in self.connected_accounts:
+            return
+
+        # Remember current selection
+        current_selection = self._current_message_id
+
+        def on_messages_synced(success, error=None, messages_data=None):
+            if not success or not messages_data:
+                return
+
+            # Check if we have new messages or changes
+            new_ids = {m.get('item_id') for m in messages_data}
+            old_ids = set(self._messages_by_id.keys())
+
+            if new_ids == old_ids:
+                # No changes, just update read status etc.
+                for msg in messages_data:
+                    item_id = msg.get('item_id')
+                    if item_id in self._messages_by_id:
+                        self._messages_by_id[item_id] = msg
+                # Update model for read status changes
+                self._message_model.update_messages(messages_data)
+                return
+
+            # There are changes - update the list but preserve selection
+            self._messages_by_id.clear()
+            for msg in messages_data:
+                item_id = msg.get('item_id')
+                if item_id:
+                    self._messages_by_id[item_id] = msg
+
+            self._message_model.clear()
+            self._message_model.add_messages(messages_data)
+
+            # Restore selection if the message still exists
+            if current_selection and current_selection in self._messages_by_id:
+                for row in range(self._message_model.rowCount()):
+                    idx = self._message_model.index(row, 0)
+                    msg = self._message_model.data(idx, Qt.ItemDataRole.DisplayRole)
+                    if msg and msg.item_id == current_selection:
+                        self._message_list.setCurrentIndex(idx)
+                        break
+
+            # Update status
+            new_count = len(new_ids - old_ids)
+            if new_count > 0:
+                self._statusbar.showMessage(f"{new_count} new message(s)")
+
+        self.sync_manager.sync_messages(
+            self._current_account_id,
+            self._current_folder_id,
+            callback=on_messages_synced
+        )
 
     def _add_account(self):
         """Add new account."""
@@ -2133,7 +3066,9 @@ class MailbenchWindow(QMainWindow):
         self.releaseKeyboard()
         self.releaseMouse()
 
-        # Signal threads to stop and close sessions
+        # Stop change listeners and signal threads to stop
+        for account_id in self.connected_accounts:
+            self.sync_manager.stop_change_listener(account_id)
         self.sync_manager._shutdown = True
         self.kerio_pool.close_all()
 
@@ -2144,18 +3079,13 @@ class MailbenchWindow(QMainWindow):
 
 def main():
     """Main entry point."""
-    # Force X11/XWayland to avoid Wayland keyboard grab issues on exit
-    import os
-    if os.environ.get("XDG_SESSION_TYPE") == "wayland":
-        os.environ["QT_QPA_PLATFORM"] = "xcb"
-
     app = QApplication(sys.argv)
     app.setApplicationName("Mailbench")
     app.setApplicationVersion(__version__)
     app.setOrganizationName("Mailbench")
 
     # Enable high DPI scaling
-    app.setStyle("Fusion")
+    # app.setStyle("Fusion")  # Disabled - was breaking menu hover on some systems
 
     window = MailbenchWindow()
     window.show()

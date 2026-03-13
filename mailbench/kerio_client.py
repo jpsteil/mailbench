@@ -8,7 +8,46 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urljoin
+import re
 import requests
+
+
+def parse_email_address(addr: str) -> tuple[str, str]:
+    """Parse an email address string into (name, email).
+
+    Handles formats like:
+    - "email@example.com" -> ("", "email@example.com")
+    - "Name <email@example.com>" -> ("Name", "email@example.com")
+    - "<email@example.com>" -> ("", "email@example.com")
+    """
+    addr = addr.strip()
+    # Match "Name <email>" or "<email>" format
+    match = re.match(r'^(?:([^<]*?)\s*)?<([^>]+)>$', addr)
+    if match:
+        name = (match.group(1) or "").strip()
+        email = match.group(2).strip()
+        return (name, email)
+    # Plain email address
+    return ("", addr)
+
+
+def clean_error_message(msg: str) -> str:
+    """Clean up Kerio error messages with unfilled placeholders.
+
+    Kerio sometimes returns error messages with %1, %2, etc. placeholders
+    that aren't filled in. This function removes them for readability.
+    """
+    # Handle specific known error patterns for better readability
+    if "Attachment with ID" in msg and "%1" in msg:
+        return "Attachment reference expired. Please re-attach the file and try again."
+
+    # Remove unfilled placeholders like %1, %2, etc.
+    cleaned = re.sub(r'%\d+', '', msg)
+    # Clean up extra whitespace and punctuation artifacts
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    cleaned = re.sub(r'\s+([.,;:])', r'\1', cleaned)
+    cleaned = re.sub(r'([.,;:])\s*\1', r'\1', cleaned)  # Remove duplicate punctuation
+    return cleaned.strip()
 
 
 @dataclass
@@ -69,7 +108,7 @@ class KerioSession:
         result = response.json()
         if "error" in result:
             error = result["error"]
-            raise KerioError(error.get("message", "Unknown error"), error.get("code", -1))
+            raise KerioError(clean_error_message(error.get("message", "Unknown error")), error.get("code", -1))
 
         return result.get("result", {})
 
@@ -488,7 +527,12 @@ class SyncManager:
 
     def mark_as_read(self, account_id: int, item_id: str, is_read: bool = True,
                      callback: Optional[Callable] = None):
-        """Mark a message as read/unread."""
+        """Mark a message as read/unread on the server.
+
+        Security: This only updates the 'isSeen' flag on the server.
+        It does NOT send a read receipt (MDN) to the sender, even if the
+        original message requested one. This protects user privacy.
+        """
         def do_mark():
             try:
                 session = self.pool.get_session(account_id)
@@ -607,12 +651,57 @@ class SyncManager:
 
         self.executor.submit(do_move)
 
+    def empty_trash(self, account_id: int, folder_id: str,
+                    callback: Optional[Callable] = None):
+        """Permanently delete all messages in a trash folder."""
+        def do_empty():
+            try:
+                session = self.pool.get_session(account_id)
+                if not session:
+                    self._ui_callback(callback, False, "Account not connected", 0)
+                    return
+
+                # Get all message IDs in the folder
+                query = {
+                    "fields": ["id"],
+                    "start": 0,
+                    "limit": 10000  # Large limit to get all messages
+                }
+                result = session.call("Mails.get", {
+                    "folderIds": [folder_id],
+                    "query": query
+                })
+
+                messages = result.get("list", [])
+                if not messages:
+                    self._ui_callback(callback, True, None, 0)
+                    return
+
+                # Extract IDs and permanently delete
+                ids = [msg.get("id") for msg in messages if msg.get("id")]
+                if ids:
+                    session.call("Mails.remove", {"ids": ids})
+
+                # Clear local cache for this folder
+                self.db.clear_messages(account_id, folder_id)
+
+                self._ui_callback(callback, True, None, len(ids))
+
+            except Exception as e:
+                self._ui_callback(callback, False, str(e), 0)
+
+        self.executor.submit(do_empty)
+
     def send_message(self, account_id: int, to: List[str], subject: str, body: str,
                      cc: List[str] = None, bcc: List[str] = None,
                      attachments: List[dict] = None,
                      original_id: str = None, is_reply: bool = False, is_forward: bool = False,
                      callback: Optional[Callable] = None):
-        """Send a new email with optional attachments."""
+        """Send a new email with optional attachments.
+
+        Security: This function intentionally does NOT request read receipts
+        (Disposition-Notification-To header) to protect recipient privacy.
+        """
         def do_send():
             try:
                 session = self.pool.get_session(account_id)
@@ -620,10 +709,16 @@ class SyncManager:
                     self._ui_callback(callback, False, "Account not connected")
                     return
 
-                # Build recipients
-                to_list = [{"address": addr} for addr in to]
-                cc_list = [{"address": addr} for addr in (cc or [])]
-                bcc_list = [{"address": addr} for addr in (bcc or [])]
+                # Build recipients - parse "Name <email>" format to extract email
+                def build_recipient(addr):
+                    name, email = parse_email_address(addr)
+                    if name:
+                        return {"name": name, "address": email}
+                    return {"address": email}
+
+                to_list = [build_recipient(addr) for addr in to]
+                cc_list = [build_recipient(addr) for addr in (cc or [])]
+                bcc_list = [build_recipient(addr) for addr in (bcc or [])]
 
                 mail = {
                     "from": {"address": session.config.email},
@@ -659,7 +754,7 @@ class SyncManager:
                 # Check for errors in result
                 errors = result.get("errors", [])
                 if errors:
-                    error_msgs = [e.get("message", str(e)) for e in errors]
+                    error_msgs = [clean_error_message(e.get("message", str(e))) for e in errors]
                     self._ui_callback(callback, False, "; ".join(error_msgs))
                     return
 

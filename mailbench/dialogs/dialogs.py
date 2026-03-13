@@ -25,7 +25,7 @@ class AccountDialog(QDialog):
 
         self.setWindowTitle("Manage Accounts" if not edit_account_id else "Edit Account")
         self.setMinimumSize(800, 400)
-        self.setModal(True)
+        self.setWindowModality(Qt.WindowModality.WindowModal)
 
         self._create_ui()
         self._load_accounts()
@@ -277,9 +277,49 @@ class SettingsDialog(QDialog):
 
         self.setWindowTitle("Settings")
         self.setMinimumSize(450, 250)
-        self.setModal(True)
+        self.setWindowModality(Qt.WindowModality.WindowModal)
 
         self._create_ui()
+
+    def _get_default_downloads_dir(self) -> str:
+        """Get the OS-appropriate default downloads directory."""
+        import platform
+        system = platform.system()
+
+        if system == "Windows":
+            # Try to get Windows Downloads folder
+            try:
+                import winreg
+                sub_key = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders"
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sub_key) as key:
+                    downloads = winreg.QueryValueEx(key, "{374DE290-123F-4565-9164-39C4925E467B}")[0]
+                    if os.path.isdir(downloads):
+                        return downloads
+            except Exception:
+                pass
+            # Fallback for Windows
+            return os.path.join(os.path.expanduser("~"), "Downloads")
+
+        elif system == "Darwin":
+            # macOS
+            return os.path.join(os.path.expanduser("~"), "Downloads")
+
+        else:
+            # Linux/Unix - check XDG user dirs
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ["xdg-user-dir", "DOWNLOAD"],
+                    capture_output=True, text=True, timeout=2
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    path = result.stdout.strip()
+                    if os.path.isdir(path):
+                        return path
+            except Exception:
+                pass
+            # Fallback for Linux
+            return os.path.join(os.path.expanduser("~"), "Downloads")
 
     def _create_ui(self):
         layout = QVBoxLayout(self)
@@ -309,10 +349,10 @@ class SettingsDialog(QDialog):
 
         # Default save directory
         save_layout = QHBoxLayout()
-        save_layout.addWidget(QLabel("Default Save Directory:"))
+        save_layout.addWidget(QLabel("Downloads Directory:"))
         current_dir = self.db.get_setting("default_save_directory", "")
         if not current_dir:
-            current_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+            current_dir = self._get_default_downloads_dir()
         self.save_dir_edit = QLineEdit(current_dir)
         save_layout.addWidget(self.save_dir_edit, 1)
         browse_btn = QPushButton("Browse...")

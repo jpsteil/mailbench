@@ -5,6 +5,16 @@ import os
 import sqlite3
 from pathlib import Path
 
+try:
+    import keyring
+    from keyring.errors import KeyringError
+    KEYRING_AVAILABLE = True
+except ImportError:
+    KEYRING_AVAILABLE = False
+    KeyringError = Exception  # Fallback for type hints
+
+KEYRING_SERVICE = "mailbench"
+
 
 def _is_installed():
     """Check if running as an installed package (pipx/pip) vs development."""
@@ -214,6 +224,15 @@ class Database:
                 ON email_cache(send_count DESC)
             """)
 
+            # Trusted senders for loading remote images
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS trusted_senders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
             conn.commit()
 
     # ==================== Settings ====================
@@ -232,6 +251,41 @@ class Database:
             )
             conn.commit()
 
+    # ==================== Trusted Senders ====================
+
+    def is_trusted_sender(self, email: str) -> bool:
+        """Check if a sender's email is in the trusted list."""
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                "SELECT 1 FROM trusted_senders WHERE email = ? COLLATE NOCASE",
+                (email,)
+            )
+            return cursor.fetchone() is not None
+
+    def add_trusted_sender(self, email: str):
+        """Add a sender to the trusted list."""
+        with self._get_conn() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO trusted_senders (email) VALUES (?)",
+                (email,)
+            )
+            conn.commit()
+
+    def remove_trusted_sender(self, email: str):
+        """Remove a sender from the trusted list."""
+        with self._get_conn() as conn:
+            conn.execute(
+                "DELETE FROM trusted_senders WHERE email = ? COLLATE NOCASE",
+                (email,)
+            )
+            conn.commit()
+
+    def get_trusted_senders(self) -> list:
+        """Get all trusted sender emails."""
+        with self._get_conn() as conn:
+            cursor = conn.execute("SELECT email FROM trusted_senders ORDER BY email")
+            return [row[0] for row in cursor.fetchall()]
+
     # ==================== Accounts ====================
 
     def get_accounts(self):
@@ -246,55 +300,73 @@ class Database:
             return [dict(row) for row in cursor.fetchall()]
 
     def get_account(self, account_id):
-        """Get a single account by ID (includes password)."""
+        """Get a single account by ID (includes password from keyring)."""
         with self._get_conn() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute("""
-                SELECT id, name, email, server, username, password, auth_type, ews_url,
+                SELECT id, name, email, server, username, auth_type, ews_url,
                        autodiscover, sync_interval, is_default, display_order, last_sync
                 FROM accounts WHERE id = ?
             """, (account_id,))
             row = cursor.fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            account = dict(row)
+            # Fetch password from keyring
+            account['password'] = self._get_password(account['email'])
+            return account
 
     def get_account_by_name(self, name):
-        """Get a single account by name (includes password)."""
+        """Get a single account by name (includes password from keyring)."""
         with self._get_conn() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute("""
-                SELECT id, name, email, server, username, password, auth_type, ews_url,
+                SELECT id, name, email, server, username, auth_type, ews_url,
                        autodiscover, sync_interval, is_default, display_order, last_sync
                 FROM accounts WHERE name = ?
             """, (name,))
             row = cursor.fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            account = dict(row)
+            # Fetch password from keyring
+            account['password'] = self._get_password(account['email'])
+            return account
 
     def save_account(self, name, email, server, username, password, auth_type='basic',
                      ews_url=None, autodiscover=False, sync_interval=300, is_default=False,
                      display_order=0, account_id=None):
-        """Save or update an account."""
+        """Save or update an account. Password is stored in OS keyring."""
+        # Store password in keyring
+        self._set_password(email, password)
+
         with self._get_conn() as conn:
             if account_id:
                 conn.execute("""
                     UPDATE accounts SET
-                        name = ?, email = ?, server = ?, username = ?, password = ?,
+                        name = ?, email = ?, server = ?, username = ?,
                         auth_type = ?, ews_url = ?, autodiscover = ?, sync_interval = ?,
                         is_default = ?, display_order = ?
                     WHERE id = ?
-                """, (name, email, server, username, password, auth_type, ews_url,
+                """, (name, email, server, username, auth_type, ews_url,
                       1 if autodiscover else 0, sync_interval, 1 if is_default else 0,
                       display_order, account_id))
             else:
                 conn.execute("""
-                    INSERT INTO accounts (name, email, server, username, password, auth_type,
+                    INSERT INTO accounts (name, email, server, username, auth_type,
                                          ews_url, autodiscover, sync_interval, is_default, display_order)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (name, email, server, username, password, auth_type, ews_url,
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (name, email, server, username, auth_type, ews_url,
                       1 if autodiscover else 0, sync_interval, 1 if is_default else 0, display_order))
             conn.commit()
 
     def delete_account(self, account_id):
         """Delete an account and all associated data."""
+        # Get email to delete password from keyring
+        account = self.get_account(account_id)
+        if account:
+            self._delete_password(account['email'])
+
         with self._get_conn() as conn:
             conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
             conn.commit()
@@ -307,6 +379,74 @@ class Database:
                 (account_id,)
             )
             conn.commit()
+
+    # ==================== Keyring Helpers ====================
+
+    def _get_password(self, email):
+        """Get password from OS keyring."""
+        if not KEYRING_AVAILABLE:
+            raise RuntimeError("Keyring not available. Install 'keyring' package and ensure a keyring backend is running (gnome-keyring, kwallet, etc.)")
+        try:
+            password = keyring.get_password(KEYRING_SERVICE, email)
+            return password or ""
+        except KeyringError as e:
+            raise RuntimeError(f"Failed to access keyring: {e}")
+
+    def _set_password(self, email, password):
+        """Store password in OS keyring."""
+        if not KEYRING_AVAILABLE:
+            raise RuntimeError("Keyring not available. Install 'keyring' package and ensure a keyring backend is running (gnome-keyring, kwallet, etc.)")
+        try:
+            keyring.set_password(KEYRING_SERVICE, email, password)
+        except KeyringError as e:
+            raise RuntimeError(f"Failed to store password in keyring: {e}")
+
+    def _delete_password(self, email):
+        """Delete password from OS keyring."""
+        if not KEYRING_AVAILABLE:
+            return
+        try:
+            keyring.delete_password(KEYRING_SERVICE, email)
+        except KeyringError:
+            pass  # Ignore errors when deleting (may not exist)
+
+    def migrate_passwords_to_keyring(self):
+        """Migrate plaintext passwords from database to keyring.
+
+        Called once on startup to handle existing accounts.
+        Returns number of passwords migrated.
+        """
+        if not KEYRING_AVAILABLE:
+            return 0
+
+        migrated = 0
+        with self._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            # Check if password column exists and has data
+            try:
+                cursor = conn.execute("SELECT id, email, password FROM accounts WHERE password IS NOT NULL AND password != ''")
+                rows = cursor.fetchall()
+            except sqlite3.OperationalError:
+                # password column doesn't exist, nothing to migrate
+                return 0
+
+            for row in rows:
+                email = row['email']
+                password = row['password']
+                if password:
+                    try:
+                        # Store in keyring
+                        keyring.set_password(KEYRING_SERVICE, email, password)
+                        # Clear from database
+                        conn.execute("UPDATE accounts SET password = '' WHERE id = ?", (row['id'],))
+                        migrated += 1
+                    except KeyringError:
+                        pass  # Leave password in DB if keyring fails
+
+            if migrated > 0:
+                conn.commit()
+
+        return migrated
 
     # ==================== Folders ====================
 

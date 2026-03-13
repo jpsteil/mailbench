@@ -8,12 +8,68 @@ from datetime import datetime
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QComboBox, QTextEdit, QPushButton,
-    QFileDialog, QMessageBox, QSizePolicy, QFrame, QCompleter
+    QFileDialog, QMessageBox, QSizePolicy, QFrame, QCompleter,
+    QMenu, QToolButton, QApplication
 )
 from PySide6.QtCore import Qt, Signal, QStringListModel
 from PySide6.QtGui import (
     QFont, QTextCharFormat, QAction, QKeySequence, QTextCursor
 )
+
+
+class RichTextEdit(QTextEdit):
+    """QTextEdit with guaranteed clipboard support."""
+
+    def keyPressEvent(self, event):
+        """Handle key press events, ensuring clipboard operations work."""
+        # Check for Ctrl+V (paste)
+        if event.key() == Qt.Key.Key_V and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            self._do_paste()
+            event.accept()
+            return
+        # Check for Ctrl+C (copy)
+        if event.key() == Qt.Key.Key_C and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            self.copy()
+            event.accept()
+            return
+        # Check for Ctrl+X (cut)
+        if event.key() == Qt.Key.Key_X and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            self.cut()
+            event.accept()
+            return
+        # Check for Ctrl+A (select all)
+        if event.key() == Qt.Key.Key_A and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            self.selectAll()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _do_paste(self):
+        """Paste clipboard contents at cursor position."""
+        clipboard = QApplication.clipboard()
+        mime = clipboard.mimeData()
+
+        # Try image first (for screenshots)
+        if mime.hasImage():
+            image = clipboard.image()
+            if not image.isNull():
+                # Convert image to base64 data URI
+                from PySide6.QtCore import QBuffer, QByteArray
+                buffer = QByteArray()
+                qbuffer = QBuffer(buffer)
+                qbuffer.open(QBuffer.OpenModeFlag.WriteOnly)
+                image.save(qbuffer, "PNG")
+                qbuffer.close()
+                import base64
+                b64_data = base64.b64encode(buffer.data()).decode('ascii')
+                img_html = f'<img src="data:image/png;base64,{b64_data}"/>'
+                self.insertHtml(img_html)
+                return
+
+        if mime.hasHtml():
+            self.insertHtml(mime.html())
+        elif mime.hasText():
+            self.insertPlainText(mime.text())
 
 
 class AddressLineEdit(QLineEdit):
@@ -42,7 +98,7 @@ class AddressLineEdit(QLineEdit):
                 priority = 2
             sorted_addrs.append((priority, addr))
 
-        sorted_addrs.sort(key=lambda x: (x[0], x[1].get('name', '').lower()))
+        sorted_addrs.sort(key=lambda x: (x[0], (x[1].get('name') or '').lower()))
 
         # Build display strings
         self._addresses = []
@@ -89,7 +145,7 @@ class ComposeWidget(QWidget):
         self._font_size = font_size
         self._zoom = zoom / 100.0  # Convert percentage to factor
 
-        self._is_dark = db.get_setting("dark_mode", "0") == "1"
+        self._is_dark = False  # Always light mode
 
         self._create_ui()
         self._setup_shortcuts()
@@ -175,6 +231,14 @@ class ComposeWidget(QWidget):
 
         layout.addLayout(header)
 
+        # Attachments area (hidden when empty)
+        self._attachments_widget = QWidget()
+        self._attachments_layout = QVBoxLayout(self._attachments_widget)
+        self._attachments_layout.setContentsMargins(0, 5, 0, 5)
+        self._attachments_layout.setSpacing(5)
+        self._attachments_widget.hide()
+        layout.addWidget(self._attachments_widget)
+
         # Formatting toolbar
         format_bar = QHBoxLayout()
 
@@ -220,15 +284,10 @@ class ComposeWidget(QWidget):
         format_bar.addWidget(bullet_btn)
 
         format_bar.addStretch()
-
-        # Attachments display
-        self.attach_label = QLabel("")
-        format_bar.addWidget(self.attach_label)
-
         layout.addLayout(format_bar)
 
         # Body editor
-        self.body_edit = QTextEdit()
+        self.body_edit = RichTextEdit()
         # Use a proper sans-serif font with zoom applied
         body_font = QFont("Sans Serif")
         body_font.setPointSize(int(self._font_size * self._zoom))
@@ -240,35 +299,44 @@ class ComposeWidget(QWidget):
 
     def _setup_shortcuts(self):
         """Setup keyboard shortcuts."""
+        # Use WidgetWithChildrenShortcut context so child widgets still get their shortcuts
+        context = Qt.ShortcutContext.WidgetWithChildrenShortcut
+
         # Ctrl+B for bold
         bold_shortcut = QAction(self)
         bold_shortcut.setShortcut(QKeySequence("Ctrl+B"))
+        bold_shortcut.setShortcutContext(context)
         bold_shortcut.triggered.connect(self._toggle_bold)
         self.addAction(bold_shortcut)
 
         # Ctrl+I for italic
         italic_shortcut = QAction(self)
         italic_shortcut.setShortcut(QKeySequence("Ctrl+I"))
+        italic_shortcut.setShortcutContext(context)
         italic_shortcut.triggered.connect(self._toggle_italic)
         self.addAction(italic_shortcut)
 
         # Ctrl+U for underline
         underline_shortcut = QAction(self)
         underline_shortcut.setShortcut(QKeySequence("Ctrl+U"))
+        underline_shortcut.setShortcutContext(context)
         underline_shortcut.triggered.connect(self._toggle_underline)
         self.addAction(underline_shortcut)
 
         # Ctrl+Enter to send
         send_shortcut = QAction(self)
         send_shortcut.setShortcut(QKeySequence("Ctrl+Return"))
+        send_shortcut.setShortcutContext(context)
         send_shortcut.triggered.connect(self._send)
         self.addAction(send_shortcut)
 
         # Escape to discard
         esc_shortcut = QAction(self)
         esc_shortcut.setShortcut(QKeySequence("Escape"))
+        esc_shortcut.setShortcutContext(context)
         esc_shortcut.triggered.connect(self._discard)
         self.addAction(esc_shortcut)
+
 
     def _toggle_bold(self):
         """Toggle bold formatting."""
@@ -322,6 +390,27 @@ class ComposeWidget(QWidget):
         """Insert bullet point."""
         self.body_edit.insertPlainText("• ")
 
+    def _paste(self):
+        """Paste clipboard contents at cursor position."""
+        # Get the currently focused widget
+        focused = QApplication.focusWidget()
+        if focused == self.body_edit:
+            self.body_edit.paste()
+        elif focused == self.to_edit:
+            self.to_edit.paste()
+        elif focused == self.cc_edit:
+            self.cc_edit.paste()
+        elif focused == self.subject_edit:
+            self.subject_edit.paste()
+        elif hasattr(focused, 'paste'):
+            focused.paste()
+
+    def _select_all(self):
+        """Select all text in focused widget."""
+        focused = QApplication.focusWidget()
+        if hasattr(focused, 'selectAll'):
+            focused.selectAll()
+
     def _attach(self):
         """Add attachments."""
         files, _ = QFileDialog.getOpenFileNames(self, "Select files to attach")
@@ -336,13 +425,185 @@ class ComposeWidget(QWidget):
 
         self._update_attachments_display()
 
-    def _update_attachments_display(self):
-        """Update attachments label."""
-        if self._attachments:
-            names = [a['name'] for a in self._attachments]
-            self.attach_label.setText(f"Attachments: {', '.join(names)}")
+    def _format_file_size(self, size_bytes: int) -> str:
+        """Format file size in human-readable form."""
+        if size_bytes < 1024:
+            return f"{size_bytes} B"
+        elif size_bytes < 1024 * 1024:
+            return f"{size_bytes / 1024:.1f} KB"
         else:
-            self.attach_label.setText("")
+            return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+    def _get_file_icon(self, filename: str) -> str:
+        """Get an icon character based on file extension."""
+        ext = os.path.splitext(filename.lower())[1]
+        if ext in {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg'}:
+            return "🖼"
+        elif ext in {'.pdf'}:
+            return "📄"
+        elif ext in {'.doc', '.docx', '.odt', '.rtf'}:
+            return "📝"
+        elif ext in {'.xls', '.xlsx', '.ods', '.csv'}:
+            return "📊"
+        elif ext in {'.ppt', '.pptx', '.odp'}:
+            return "📽"
+        elif ext in {'.zip', '.rar', '.7z', '.tar', '.gz'}:
+            return "📦"
+        elif ext in {'.mp3', '.wav', '.ogg', '.flac', '.m4a'}:
+            return "🎵"
+        elif ext in {'.mp4', '.avi', '.mkv', '.mov', '.webm'}:
+            return "🎬"
+        elif ext in {'.txt', '.log'}:
+            return "📃"
+        elif ext in {'.exe', '.msi', '.bat', '.cmd'}:
+            return "⚙"
+        else:
+            return "📎"
+
+    def _clear_attachments_layout(self):
+        """Clear all widgets from attachments layout."""
+        while self._attachments_layout.count():
+            child = self._attachments_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+    def _remove_attachment(self, index: int):
+        """Remove an attachment by index."""
+        if 0 <= index < len(self._attachments):
+            del self._attachments[index]
+            self._update_attachments_display()
+
+    def _update_attachments_display(self):
+        """Update attachments display with cards."""
+        self._clear_attachments_layout()
+
+        if not self._attachments:
+            self._attachments_widget.hide()
+            return
+
+        self._attachments_widget.show()
+
+        # Header: "X Attachment(s)"
+        count = len(self._attachments)
+        header = QLabel(f"{count} Attachment{'s' if count > 1 else ''}")
+        header_color = "#999" if self._is_dark else "#666"
+        header.setStyleSheet(f"font-weight: bold; color: {header_color};")
+        self._attachments_layout.addWidget(header)
+
+        # Attachment cards in a horizontal flow
+        cards_widget = QWidget()
+        cards_layout = QHBoxLayout(cards_widget)
+        cards_layout.setContentsMargins(0, 0, 0, 0)
+        cards_layout.setSpacing(10)
+
+        for i, att in enumerate(self._attachments):
+            card = self._create_attachment_card(i, att)
+            cards_layout.addWidget(card)
+
+        cards_layout.addStretch()
+        self._attachments_layout.addWidget(cards_widget)
+
+    def _create_attachment_card(self, index: int, attachment: dict) -> QWidget:
+        """Create a card widget for an attachment."""
+        card = QFrame()
+        card.setFrameShape(QFrame.Shape.NoFrame)
+
+        if self._is_dark:
+            card.setStyleSheet("""
+                QFrame#attachCard {
+                    background-color: #3c3f41;
+                    border: 1px solid #555;
+                    border-radius: 4px;
+                }
+                QFrame#attachCard:hover {
+                    background-color: #4c5052;
+                    border: 1px solid #666;
+                }
+            """)
+        else:
+            card.setStyleSheet("""
+                QFrame#attachCard {
+                    background-color: #f5f5f5;
+                    border: 1px solid #ddd;
+                    border-radius: 4px;
+                }
+                QFrame#attachCard:hover {
+                    background-color: #e8e8e8;
+                    border: 1px solid #ccc;
+                }
+            """)
+        card.setObjectName("attachCard")
+
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(8, 5, 8, 5)
+        layout.setSpacing(8)
+
+        # Icon
+        name = attachment.get('name', 'attachment')
+        icon_label = QLabel(self._get_file_icon(name))
+        icon_label.setStyleSheet("font-size: 24px; background: transparent; border: none;")
+        layout.addWidget(icon_label)
+
+        # Name and size
+        info_widget = QWidget()
+        info_widget.setStyleSheet("background: transparent; border: none;")
+        info_layout = QVBoxLayout(info_widget)
+        info_layout.setContentsMargins(0, 0, 0, 0)
+        info_layout.setSpacing(0)
+
+        # Truncate long names
+        display_name = name
+        if len(display_name) > 25:
+            display_name = display_name[:22] + "..."
+
+        name_label = QLabel(display_name)
+        name_label.setStyleSheet("font-weight: 500; background: transparent; border: none;")
+        name_label.setToolTip(name)
+        info_layout.addWidget(name_label)
+
+        # Size
+        content = attachment.get('content', b'')
+        size = len(content) if isinstance(content, bytes) else len(content.encode('utf-8') if content else b'')
+        size_label = QLabel(self._format_file_size(size))
+        size_color = "#777" if self._is_dark else "#888"
+        size_label.setStyleSheet(f"color: {size_color}; font-size: 11px; background: transparent; border: none;")
+        info_layout.addWidget(size_label)
+
+        layout.addWidget(info_widget)
+
+        # Menu button with dropdown
+        menu_btn = QToolButton()
+        menu_btn.setText("▼")
+        menu_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu_btn.setFixedSize(24, 24)
+
+        btn_style = f"""
+            QToolButton {{
+                background: transparent;
+                border: none;
+                font-size: 10px;
+                color: {'#888' if self._is_dark else '#666'};
+            }}
+            QToolButton:hover {{
+                background-color: {'#4c5052' if self._is_dark else '#ddd'};
+                border-radius: 4px;
+            }}
+            QToolButton::menu-indicator {{
+                image: none;
+            }}
+        """
+        menu_btn.setStyleSheet(btn_style)
+
+        menu = QMenu(menu_btn)
+
+        # For compose window, only delete makes sense
+        delete_action = menu.addAction("🗑 Remove")
+        delete_action.triggered.connect(lambda checked, idx=index: self._remove_attachment(idx))
+
+        menu_btn.setMenu(menu)
+        layout.addWidget(menu_btn)
+
+        return card
 
     def _html_to_plain_text(self, html_body):
         """Convert HTML to plain text, properly stripping style/script blocks."""
@@ -491,11 +752,13 @@ class ComposeWidget(QWidget):
 
         self.body_edit.setHtml(html_content)
 
-        # Move cursor to beginning
+        # Move cursor to beginning and focus body
         cursor = self.body_edit.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.Start)
         self.body_edit.setTextCursor(cursor)
-        self.body_edit.setFocus()
+        # Use timer to ensure focus after widget is fully shown
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(50, self.body_edit.setFocus)
 
     def _setup_forward(self, original_message):
         """Setup for forward."""
@@ -657,17 +920,6 @@ class ComposeWidget(QWidget):
         self.body_edit.viewport().update()
 
     def _apply_theme(self):
-        """Apply dark/light theme."""
-        if self._is_dark:
-            self.setStyleSheet("""
-                QWidget { background-color: #2b2b2b; color: #a9b7c6; }
-                QTextEdit, QLineEdit { background-color: #313335; color: #a9b7c6; border: 1px solid #3c3f41; }
-                QComboBox { background-color: #313335; color: #a9b7c6; border: 1px solid #3c3f41; }
-                QPushButton { background-color: #3c3f41; color: #a9b7c6; padding: 5px 10px; border: none; }
-                QPushButton:hover { background-color: #4c5052; }
-                QPushButton:checked { background-color: #214283; }
-            """)
-        else:
-            self.setStyleSheet("""
-                QPushButton:checked { background-color: #0078d4; color: white; }
-            """)
+        """Apply dark/light theme - now using system defaults."""
+        # Clear any stylesheet - use system theme
+        self.setStyleSheet("")
