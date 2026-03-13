@@ -455,7 +455,7 @@ class MessageDelegate(QStyledItemDelegate):
             self.bg_unread = QColor("#f0f4f8")
             self.fg_color = QColor("#000000")
             self.fg_bold = QColor("#000000")
-            self.secondary = QColor("#666666")
+            self.secondary = QColor("#000000")  # Black text
             self.select_bg = QColor("#0078d4")
             self.border_color = QColor("#e0e0e0")
 
@@ -1323,12 +1323,12 @@ class MailbenchWindow(QMainWindow):
         from_layout.setSpacing(6)
 
         self._preview_from = QLabel("From:")
-        self._preview_from.setStyleSheet("font-weight: bold;")
+        self._preview_from.setStyleSheet("font-weight: bold; color: #000000;")
         from_layout.addWidget(self._preview_from)
 
         # Sender verification indicator (inline, hidden by default)
         self._sender_verification = QLabel("")
-        self._sender_verification.setStyleSheet("font-size: 11px;")
+        self._sender_verification.setMinimumWidth(24)
         self._sender_verification.hide()
         from_layout.addWidget(self._sender_verification)
 
@@ -1336,10 +1336,11 @@ class MailbenchWindow(QMainWindow):
         header_layout.addLayout(from_layout)
 
         self._preview_to = QLabel("To:")
+        self._preview_to.setStyleSheet("color: #000000;")
         header_layout.addWidget(self._preview_to)
 
         self._preview_subject = QLabel("")
-        self._preview_subject.setStyleSheet("font-weight: bold; font-size: 12pt;")
+        self._preview_subject.setStyleSheet("font-weight: bold; font-size: 12pt; color: #000000;")
         self._preview_subject.setWordWrap(True)
         header_layout.addWidget(self._preview_subject)
 
@@ -2006,16 +2007,22 @@ class MailbenchWindow(QMainWindow):
         # Build indicator - only show warnings, not positive indicators
         if is_suspicious:
             # Red yield sign for suspicious sender
-            self._sender_verification.setText("⚠")
+            self._sender_verification.setText("⚠️")
             self._sender_verification.setToolTip(suspicious_reason)
-            self._sender_verification.setStyleSheet("font-size: 14px; color: #cc0000;")
+            font = self._sender_verification.font()
+            font.setPointSize(16)
+            self._sender_verification.setFont(font)
+            self._sender_verification.setStyleSheet("color: #ff0000;")
             self._sender_verification.setCursor(Qt.CursorShape.WhatsThisCursor)
             self._sender_verification.show()
         elif is_external and not is_known:
-            # Yellow yield sign for unknown external sender
-            self._sender_verification.setText("⚠")
+            # Yellow/orange yield sign for unknown external sender
+            self._sender_verification.setText("⚠️")
             self._sender_verification.setToolTip("External sender - not from your organization")
-            self._sender_verification.setStyleSheet("font-size: 14px; color: #cc8800;")
+            font = self._sender_verification.font()
+            font.setPointSize(16)
+            self._sender_verification.setFont(font)
+            self._sender_verification.setStyleSheet("color: #ff8c00;")
             self._sender_verification.setCursor(Qt.CursorShape.WhatsThisCursor)
             self._sender_verification.show()
         else:
