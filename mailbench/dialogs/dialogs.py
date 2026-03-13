@@ -144,13 +144,19 @@ class AccountDialog(QDialog):
         if row < 0 or row >= len(self._accounts):
             return
 
-        acc = self.db.get_account(self._accounts[row]['id'])
+        try:
+            acc = self.db.get_account(self._accounts[row]['id'])
+        except Exception as e:
+            self.status_label.setText(f"Error loading account: {e}")
+            self.status_label.setStyleSheet("color: red;")
+            return
+
         if acc:
             self.name_edit.setText(acc['name'])
             self.email_edit.setText(acc['email'])
             self.server_edit.setText(acc['server'])
             self.username_edit.setText(acc['username'])
-            self.password_edit.setText(acc['password'])
+            self.password_edit.setText(acc['password'] or '')
             self.default_check.setChecked(bool(acc.get('is_default')))
             self._current_account_id = acc['id']
         else:
@@ -248,15 +254,20 @@ class AccountDialog(QDialog):
             QMessageBox.warning(self, "Error", f"An account named '{name}' already exists")
             return
 
-        self.db.save_account(
-            name=name,
-            email=email,
-            server=server,
-            username=username,
-            password=password,
-            is_default=is_default,
-            account_id=self._current_account_id
-        )
+        try:
+            self.db.save_account(
+                name=name,
+                email=email,
+                server=server,
+                username=username,
+                password=password,
+                is_default=is_default,
+                account_id=self._current_account_id
+            )
+        except Exception as e:
+            self.status_label.setText(f"Error: {e}")
+            self.status_label.setStyleSheet("color: red;")
+            return
 
         self._load_accounts()
         self.status_label.setText("Account saved")
