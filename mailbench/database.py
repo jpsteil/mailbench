@@ -353,9 +353,9 @@ class Database:
                       display_order, account_id))
             else:
                 conn.execute("""
-                    INSERT INTO accounts (name, email, server, username, auth_type,
+                    INSERT INTO accounts (name, email, server, username, password, auth_type,
                                          ews_url, autodiscover, sync_interval, is_default, display_order)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)
                 """, (name, email, server, username, auth_type, ews_url,
                       1 if autodiscover else 0, sync_interval, 1 if is_default else 0, display_order))
             conn.commit()
