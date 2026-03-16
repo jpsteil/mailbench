@@ -40,6 +40,28 @@ from mailbench.kerio_client import KerioConnectionPool, SyncManager, KerioConfig
 from mailbench.version import __version__
 
 
+def get_icon(theme_names: list, standard_pixmap: QStyle.StandardPixmap = None) -> QIcon:
+    """Get icon from theme with fallback to Qt standard icon.
+
+    Args:
+        theme_names: List of freedesktop icon theme names to try
+        standard_pixmap: Qt standard pixmap to use as fallback
+
+    Returns:
+        QIcon - either from theme or standard pixmap
+    """
+    for name in theme_names:
+        icon = QIcon.fromTheme(name)
+        if not icon.isNull():
+            return icon
+
+    # Fall back to Qt standard icon
+    if standard_pixmap is not None:
+        return QApplication.style().standardIcon(standard_pixmap)
+
+    return QIcon()
+
+
 def block_remote_images(html: str) -> str:
     """Block remote images to prevent tracking pixels and IP leakage.
 
@@ -665,16 +687,18 @@ class FolderTreeModel(QStandardItemModel):
 
     def _get_folder_icon(self, folder_name: str) -> Optional[QIcon]:
         """Get icon for a folder based on its name."""
+        # Use DirIcon as fallback for all folder types
+        fallback = QStyle.StandardPixmap.SP_DirIcon
         if 'inbox' in folder_name:
-            return QIcon.fromTheme("mail-inbox", QIcon.fromTheme("folder"))
+            return get_icon(["mail-inbox", "folder"], fallback)
         elif 'sent' in folder_name:
-            return QIcon.fromTheme("mail-sent", QIcon.fromTheme("folder"))
+            return get_icon(["mail-sent", "folder"], fallback)
         elif 'draft' in folder_name:
-            return QIcon.fromTheme("mail-drafts", QIcon.fromTheme("folder"))
+            return get_icon(["mail-drafts", "folder"], fallback)
         elif 'spam' in folder_name or 'junk' in folder_name:
-            return QIcon.fromTheme("mail-mark-junk", QIcon.fromTheme("folder"))
+            return get_icon(["mail-mark-junk", "folder"], fallback)
         elif 'trash' in folder_name or 'deleted' in folder_name:
-            return QIcon.fromTheme("user-trash", QIcon.fromTheme("folder"))
+            return get_icon(["user-trash", "folder"], QStyle.StandardPixmap.SP_TrashIcon)
         return None
 
     def _get_or_create_folders_group(self, account_id: int) -> QStandardItem:
@@ -810,21 +834,37 @@ class MessageWindow(QMainWindow):
         toolbar.setIconSize(QSize(20, 20))
         self.addToolBar(toolbar)
 
-        reply_action = QAction(QIcon.fromTheme("mail-reply-sender", QIcon.fromTheme("go-previous")), "Reply", self)
+        reply_icon = get_icon(
+            ["mail-reply-sender", "go-previous"],
+            QStyle.StandardPixmap.SP_ArrowBack
+        )
+        reply_action = QAction(reply_icon, "Reply", self)
         reply_action.triggered.connect(self._reply)
         toolbar.addAction(reply_action)
 
-        reply_all_action = QAction(QIcon.fromTheme("mail-reply-all"), "Reply All", self)
+        reply_all_icon = get_icon(
+            ["mail-reply-all", "mail-reply-sender"],
+            QStyle.StandardPixmap.SP_ArrowBack
+        )
+        reply_all_action = QAction(reply_all_icon, "Reply All", self)
         reply_all_action.triggered.connect(self._reply_all)
         toolbar.addAction(reply_all_action)
 
-        forward_action = QAction(QIcon.fromTheme("mail-forward", QIcon.fromTheme("go-next")), "Forward", self)
+        forward_icon = get_icon(
+            ["mail-forward", "go-next"],
+            QStyle.StandardPixmap.SP_ArrowForward
+        )
+        forward_action = QAction(forward_icon, "Forward", self)
         forward_action.triggered.connect(self._forward)
         toolbar.addAction(forward_action)
 
         toolbar.addSeparator()
 
-        delete_action = QAction(QIcon.fromTheme("edit-delete", QIcon.fromTheme("user-trash")), "Delete", self)
+        delete_icon = get_icon(
+            ["edit-delete", "user-trash"],
+            QStyle.StandardPixmap.SP_TrashIcon
+        )
+        delete_action = QAction(delete_icon, "Delete", self)
         delete_action.triggered.connect(self._delete)
         toolbar.addAction(delete_action)
 
@@ -1231,37 +1271,61 @@ class MailbenchWindow(QMainWindow):
         toolbar.setIconSize(QSize(20, 20))
         self.addToolBar(toolbar)
 
-        # Create actions with icons
-        new_action = QAction(QIcon.fromTheme("mail-message-new", QIcon.fromTheme("document-new")), "New", self)
+        # Create actions with icons (theme icons with Qt standard fallbacks)
+        new_icon = get_icon(
+            ["mail-message-new", "document-new"],
+            QStyle.StandardPixmap.SP_FileDialogNewFolder
+        )
+        new_action = QAction(new_icon, "New", self)
         new_action.triggered.connect(self._new_message)
         new_action.setToolTip("Compose new message (Ctrl+N)")
         toolbar.addAction(new_action)
 
         toolbar.addSeparator()
 
-        self._reply_action = QAction(QIcon.fromTheme("mail-reply-sender", QIcon.fromTheme("go-previous")), "Reply", self)
+        reply_icon = get_icon(
+            ["mail-reply-sender", "go-previous"],
+            QStyle.StandardPixmap.SP_ArrowBack
+        )
+        self._reply_action = QAction(reply_icon, "Reply", self)
         self._reply_action.triggered.connect(self._reply)
         self._reply_action.setToolTip("Reply to sender (Ctrl+R)")
         toolbar.addAction(self._reply_action)
 
-        self._reply_all_action = QAction(QIcon.fromTheme("mail-reply-all"), "Reply All", self)
+        reply_all_icon = get_icon(
+            ["mail-reply-all", "mail-reply-sender"],
+            QStyle.StandardPixmap.SP_ArrowBack
+        )
+        self._reply_all_action = QAction(reply_all_icon, "Reply All", self)
         self._reply_all_action.triggered.connect(self._reply_all)
         self._reply_all_action.setToolTip("Reply to all (Ctrl+Shift+R)")
         toolbar.addAction(self._reply_all_action)
 
-        self._forward_action = QAction(QIcon.fromTheme("mail-forward", QIcon.fromTheme("go-next")), "Forward", self)
+        forward_icon = get_icon(
+            ["mail-forward", "go-next"],
+            QStyle.StandardPixmap.SP_ArrowForward
+        )
+        self._forward_action = QAction(forward_icon, "Forward", self)
         self._forward_action.triggered.connect(self._forward)
         self._forward_action.setToolTip("Forward message (Ctrl+Shift+F)")
         toolbar.addAction(self._forward_action)
 
         toolbar.addSeparator()
 
-        self._delete_action = QAction(QIcon.fromTheme("edit-delete", QIcon.fromTheme("user-trash")), "Delete", self)
+        delete_icon = get_icon(
+            ["edit-delete", "user-trash"],
+            QStyle.StandardPixmap.SP_TrashIcon
+        )
+        self._delete_action = QAction(delete_icon, "Delete", self)
         self._delete_action.triggered.connect(self._delete_messages)
         self._delete_action.setToolTip("Delete selected messages (Delete)")
         toolbar.addAction(self._delete_action)
 
-        refresh_action = QAction(QIcon.fromTheme("view-refresh", QIcon.fromTheme("sync")), "Refresh", self)
+        refresh_icon = get_icon(
+            ["view-refresh", "sync"],
+            QStyle.StandardPixmap.SP_BrowserReload
+        )
+        refresh_action = QAction(refresh_icon, "Refresh", self)
         refresh_action.triggered.connect(self._check_mail)
         refresh_action.setToolTip("Check for new mail (F5)")
         toolbar.addAction(refresh_action)
