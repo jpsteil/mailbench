@@ -3166,10 +3166,13 @@ class MailbenchWindow(QMainWindow):
         def do_upgrade():
             try:
                 result = subprocess.run(
-                    ["pipx", "upgrade", "mailbench"],
+                    ["pipx", "upgrade", "mailbench", "--force"],
                     capture_output=True, text=True,
                     stdin=subprocess.DEVNULL, timeout=120)
                 if result.returncode == 0:
+                    # Give pipx time to finalize
+                    import time
+                    time.sleep(2)
                     self._upgrade_result = (True, "Mailbench has been upgraded.")
                 else:
                     error = result.stderr or result.stdout or "Unknown error"
