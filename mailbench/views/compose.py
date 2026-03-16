@@ -13,7 +13,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal, QStringListModel
 from PySide6.QtGui import (
-    QFont, QTextCharFormat, QAction, QKeySequence, QTextCursor
+    QFont, QTextCharFormat, QAction, QKeySequence, QTextCursor,
+    QTextBlockFormat
 )
 
 
@@ -293,9 +294,28 @@ class ComposeWidget(QWidget):
         body_font.setPointSize(int(self._font_size * self._zoom))
         self.body_edit.setFont(body_font)
         self.body_edit.cursorPositionChanged.connect(self._update_format_buttons)
+
+        # Set tab stop width (4 spaces worth)
+        self.body_edit.setTabStopDistance(40)
+
+        # Set default paragraph spacing (tighter than Qt default)
+        self._set_default_paragraph_format()
+
         layout.addWidget(self.body_edit, 1)
 
         self._update_attachments_display()
+
+    def _set_default_paragraph_format(self):
+        """Set default paragraph format with tighter spacing."""
+        # Set default block format for new paragraphs
+        block_fmt = QTextBlockFormat()
+        block_fmt.setTopMargin(2)
+        block_fmt.setBottomMargin(2)
+
+        # Apply to current cursor position (affects new text)
+        cursor = self.body_edit.textCursor()
+        cursor.setBlockFormat(block_fmt)
+        self.body_edit.setTextCursor(cursor)
 
     def _setup_shortcuts(self):
         """Setup keyboard shortcuts."""
@@ -666,6 +686,9 @@ class ComposeWidget(QWidget):
             cursor.movePosition(QTextCursor.MoveOperation.Start)
             self.body_edit.setTextCursor(cursor)
 
+            # Apply default paragraph format for new text
+            self._set_default_paragraph_format()
+
         self.to_edit.setFocus()
 
     def _setup_reply(self, original_message):
@@ -756,6 +779,10 @@ class ComposeWidget(QWidget):
         cursor = self.body_edit.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.Start)
         self.body_edit.setTextCursor(cursor)
+
+        # Apply default paragraph format for new text
+        self._set_default_paragraph_format()
+
         # Use timer to ensure focus after widget is fully shown
         from PySide6.QtCore import QTimer
         QTimer.singleShot(50, self.body_edit.setFocus)
@@ -824,11 +851,51 @@ class ComposeWidget(QWidget):
         cursor = self.body_edit.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.Start)
         self.body_edit.setTextCursor(cursor)
+
+        # Apply default paragraph format for new text
+        self._set_default_paragraph_format()
+
         self.to_edit.setFocus()
 
     def _get_html_body(self):
-        """Convert rich text to HTML."""
-        return self.body_edit.toHtml()
+        """Convert rich text to HTML with proper styling."""
+        html = self.body_edit.toHtml()
+
+        # Web-safe sans-serif font stack
+        font_stack = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+
+        # Replace Qt's font-family declarations with web-safe fonts
+        # Qt outputs things like: font-family:'Sans Serif'; or font-family:"Sans Serif";
+        html = re.sub(
+            r"font-family:['\"]?[^;'\"]+['\"]?;",
+            f"font-family: {font_stack};",
+            html
+        )
+
+        # Add inline style to body tag for clients that inherit from body
+        if '<body' in html:
+            if '<body style="' in html:
+                html = html.replace('<body style="', f'<body style="font-family: {font_stack}; ')
+            else:
+                html = html.replace('<body', f'<body style="font-family: {font_stack};"', 1)
+
+        # Add inline margin to p tags
+        html = re.sub(
+            r'<p([^>]*)style="([^"]*)"',
+            r'<p\1style="margin: 0.3em 0; \2"',
+            html
+        )
+        # Handle p tags without style attribute
+        html = re.sub(
+            r'<p(?![^>]*style=)([^>]*)>',
+            r'<p style="margin: 0.3em 0;"\1>',
+            html
+        )
+
+        # Convert tab characters to non-breaking spaces (4 spaces per tab)
+        html = html.replace('\t', '&nbsp;&nbsp;&nbsp;&nbsp;')
+
+        return html
 
     def _send(self):
         """Send the message."""

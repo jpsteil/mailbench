@@ -3198,7 +3198,7 @@ class MailbenchWindow(QMainWindow):
         def do_upgrade():
             try:
                 result = subprocess.run(
-                    ["pipx", "upgrade", "mailbench"],
+                    ["pipx", "upgrade", "--pip-args=--no-cache-dir", "mailbench"],
                     capture_output=True, text=True,
                     stdin=subprocess.DEVNULL, timeout=120)
                 if result.returncode == 0:
