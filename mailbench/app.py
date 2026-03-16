@@ -3166,13 +3166,10 @@ class MailbenchWindow(QMainWindow):
         def do_upgrade():
             try:
                 result = subprocess.run(
-                    ["pipx", "upgrade", "mailbench", "--force"],
+                    ["pipx", "upgrade", "mailbench"],
                     capture_output=True, text=True,
                     stdin=subprocess.DEVNULL, timeout=120)
                 if result.returncode == 0:
-                    # Give pipx time to finalize
-                    import time
-                    time.sleep(2)
                     self._upgrade_result = (True, "Mailbench has been upgraded.")
                 else:
                     error = result.stderr or result.stdout or "Unknown error"
@@ -3210,10 +3207,7 @@ class MailbenchWindow(QMainWindow):
         """Restart the application."""
         self._save_geometry()
 
-        # Small delay to ensure pipx has finished writing all files
-        import time
-        time.sleep(1)
-
+        # Start new process before closing
         if sys.argv[0].endswith('mailbench') or 'mailbench' in sys.argv[0]:
             subprocess.Popen([sys.argv[0]])
         else:
