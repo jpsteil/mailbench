@@ -446,6 +446,55 @@ class MessageListModel(QAbstractListModel):
                 self._message_map[msg.item_id] = i
             self._apply_filter()
 
+    def sync_incrementally(self, messages_data: list[dict]) -> tuple[int, int]:
+        """Sync messages incrementally - add new, remove deleted, update existing.
+
+        Returns (added_count, removed_count).
+        """
+        new_ids = {m.get('item_id') for m in messages_data if m.get('item_id')}
+        old_ids = set(self._message_map.keys())
+
+        added_ids = new_ids - old_ids
+        removed_ids = old_ids - new_ids
+
+        # Remove deleted messages
+        for item_id in removed_ids:
+            idx = self._message_map.get(item_id)
+            if idx is not None:
+                del self._messages[idx]
+                del self._message_map[item_id]
+
+        # Rebuild map after removals
+        if removed_ids:
+            self._message_map.clear()
+            for i, msg in enumerate(self._messages):
+                self._message_map[msg.item_id] = i
+
+        # Add new messages at the beginning (newest first)
+        new_messages = []
+        for msg_data in messages_data:
+            item_id = msg_data.get('item_id')
+            if item_id in added_ids:
+                new_messages.append(MessageData(msg_data))
+
+        if new_messages:
+            # Insert at beginning
+            for msg in reversed(new_messages):
+                self._messages.insert(0, msg)
+            # Rebuild map
+            self._message_map.clear()
+            for i, msg in enumerate(self._messages):
+                self._message_map[msg.item_id] = i
+
+        # Update existing messages (read/flagged status)
+        self.update_messages(messages_data)
+
+        # Reapply filter if there were changes
+        if added_ids or removed_ids:
+            self._apply_filter()
+
+        return len(added_ids), len(removed_ids)
+
 
 class MessageDelegate(QStyledItemDelegate):
     """Custom delegate for Kerio-style message rows."""
@@ -1993,9 +2042,48 @@ class MailbenchWindow(QMainWindow):
                     break
 
         if needs_refresh and self._current_account_id == account_id:
-            # Refresh the current folder
-            self._statusbar.showMessage("New mail received...")
-            self._load_messages(account_id, self._current_folder_id)
+            # Use incremental sync instead of full reload
+            self._statusbar.showMessage("Syncing...")
+            current_selection = self._current_message_id
+
+            def on_synced(success, error=None, messages_data=None):
+                if not success or not messages_data:
+                    return
+
+                # Filter blocked senders
+                filtered_messages, _ = self._filter_blocked_messages(
+                    messages_data, account_id
+                )
+
+                # Update cache
+                new_ids = {m.get('item_id') for m in filtered_messages if m.get('item_id')}
+                old_ids = set(self._messages_by_id.keys())
+                for item_id in old_ids - new_ids:
+                    if item_id in self._messages_by_id:
+                        del self._messages_by_id[item_id]
+                for msg in filtered_messages:
+                    item_id = msg.get('item_id')
+                    if item_id:
+                        self._messages_by_id[item_id] = msg
+
+                # Incremental sync
+                added, removed = self._message_model.sync_incrementally(filtered_messages)
+
+                # Restore selection
+                if (added or removed) and current_selection and current_selection in self._messages_by_id:
+                    for row in range(self._message_model.rowCount()):
+                        idx = self._message_model.index(row, 0)
+                        msg = self._message_model.data(idx, Qt.ItemDataRole.DisplayRole)
+                        if msg and msg.item_id == current_selection:
+                            self._message_list.setCurrentIndex(idx)
+                            break
+
+                if added > 0:
+                    self._statusbar.showMessage(f"{added} new message(s)")
+                else:
+                    self._statusbar.showMessage(f"{len(filtered_messages)} messages")
+
+            self.sync_manager.sync_messages(account_id, self._current_folder_id, callback=on_synced)
 
     def _load_address_book(self, account_id: int):
         """Load contacts and users for email autocomplete."""
@@ -3382,32 +3470,25 @@ class MailbenchWindow(QMainWindow):
             if not success or not messages_data:
                 return
 
-            # Check if we have new messages or changes
-            new_ids = {m.get('item_id') for m in messages_data}
+            # Update the messages_by_id cache
+            new_ids = {m.get('item_id') for m in messages_data if m.get('item_id')}
             old_ids = set(self._messages_by_id.keys())
 
-            if new_ids == old_ids:
-                # No changes, just update read status etc.
-                for msg in messages_data:
-                    item_id = msg.get('item_id')
-                    if item_id in self._messages_by_id:
-                        self._messages_by_id[item_id] = msg
-                # Update model for read status changes
-                self._message_model.update_messages(messages_data)
-                return
+            # Remove deleted from cache
+            for item_id in old_ids - new_ids:
+                del self._messages_by_id[item_id]
 
-            # There are changes - update the list but preserve selection
-            self._messages_by_id.clear()
+            # Add/update in cache
             for msg in messages_data:
                 item_id = msg.get('item_id')
                 if item_id:
                     self._messages_by_id[item_id] = msg
 
-            self._message_model.clear()
-            self._message_model.add_messages(messages_data)
+            # Incremental sync - no flashing
+            added, removed = self._message_model.sync_incrementally(messages_data)
 
-            # Restore selection if the message still exists
-            if current_selection and current_selection in self._messages_by_id:
+            # Restore selection if needed
+            if (added or removed) and current_selection and current_selection in self._messages_by_id:
                 for row in range(self._message_model.rowCount()):
                     idx = self._message_model.index(row, 0)
                     msg = self._message_model.data(idx, Qt.ItemDataRole.DisplayRole)
@@ -3416,9 +3497,8 @@ class MailbenchWindow(QMainWindow):
                         break
 
             # Update status
-            new_count = len(new_ids - old_ids)
-            if new_count > 0:
-                self._statusbar.showMessage(f"{new_count} new message(s)")
+            if added > 0:
+                self._statusbar.showMessage(f"{added} new message(s)")
 
         self.sync_manager.sync_messages(
             self._current_account_id,
