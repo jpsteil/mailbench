@@ -458,6 +458,7 @@ class SyncManager:
 
                 # Return as dict with all message data
                 msg_data = {
+                    "item_id": item_id,
                     "body": body,
                     "body_type": body_type,
                     "to": to_str,

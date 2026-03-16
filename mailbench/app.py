@@ -1468,6 +1468,13 @@ class MailbenchWindow(QMainWindow):
         self._current_body_html: Optional[str] = None
         self._images_blocked: bool = False
 
+        # Timer for delayed mark-as-read (3 second delay)
+        self._read_timer = QTimer(self)
+        self._read_timer.setSingleShot(True)
+        self._read_timer.timeout.connect(self._mark_current_as_read)
+        self._pending_read_item_id: Optional[str] = None
+        self._skip_auto_mark_read: bool = False  # Set when user manually marks unread
+
         # Preview body - use WebEngine if available for proper HTML/image support
         if HAS_WEBENGINE:
             self._preview_body = QWebEngineView()
@@ -2002,6 +2009,11 @@ class MailbenchWindow(QMainWindow):
         if msg.item_id == self._current_message_id:
             return
 
+        # Reset auto-mark-read state when selecting a different message
+        self._read_timer.stop()
+        self._pending_read_item_id = None
+        self._skip_auto_mark_read = False
+
         self._current_message_id = msg.item_id
         self._update_message_actions(True)
         self._show_message_preview(msg)
@@ -2207,18 +2219,11 @@ class MailbenchWindow(QMainWindow):
         else:
             self._images_banner.hide()
 
-        # Mark as read (locally and on server)
+        # Start 3 second timer to mark as read (unless user manually marked unread)
         item_id = data.get('item_id')
-        if item_id and self._current_account_id:
-            self._message_model.update_message(item_id, is_read=True)
-            # Sync to server
-            self.sync_manager.mark_as_read(
-                self._current_account_id, item_id, True,
-                callback=lambda s, e: None  # Silent callback
-            )
-            # Update in local cache
-            if item_id in self._messages_by_id:
-                self._messages_by_id[item_id]['is_read'] = True
+        if item_id and self._current_account_id and not self._skip_auto_mark_read:
+            self._pending_read_item_id = item_id
+            self._read_timer.start(3000)  # 3 second delay
 
     def _load_images_once(self):
         """Load remote images for current message only."""
@@ -2243,6 +2248,27 @@ class MailbenchWindow(QMainWindow):
 
         self._images_banner.hide()
         self._images_blocked = False
+
+    def _mark_current_as_read(self):
+        """Timer callback to mark the current message as read."""
+        item_id = self._pending_read_item_id
+        if not item_id or not self._current_account_id:
+            return
+
+        # Mark locally
+        self._message_model.update_message(item_id, is_read=True)
+
+        # Sync to server
+        self.sync_manager.mark_as_read(
+            self._current_account_id, item_id, True,
+            callback=lambda s, e: None  # Silent callback
+        )
+
+        # Update in local cache
+        if item_id in self._messages_by_id:
+            self._messages_by_id[item_id]['is_read'] = True
+
+        self._pending_read_item_id = None
 
     def _trust_sender(self):
         """Add current sender to trusted list and load images."""
@@ -2789,6 +2815,12 @@ class MailbenchWindow(QMainWindow):
         """Mark selected messages as read/unread."""
         if not self._current_account_id:
             return
+
+        # If marking as unread, stop auto-mark timer and set skip flag
+        if not is_read:
+            self._read_timer.stop()
+            self._pending_read_item_id = None
+            self._skip_auto_mark_read = True
 
         for index in self._message_list.selectedIndexes():
             msg: MessageData = index.data(Qt.ItemDataRole.DisplayRole)
