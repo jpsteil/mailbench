@@ -3207,6 +3207,10 @@ class MailbenchWindow(QMainWindow):
         """Restart the application."""
         self._save_geometry()
 
+        # Small delay to ensure pipx has finished writing all files
+        import time
+        time.sleep(1)
+
         if sys.argv[0].endswith('mailbench') or 'mailbench' in sys.argv[0]:
             subprocess.Popen([sys.argv[0]])
         else:
