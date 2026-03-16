@@ -811,6 +811,20 @@ class FolderTreeModel(QStandardItemModel):
         return True
 
 
+class FilterLineEdit(QLineEdit):
+    """Line edit that emits signal when down arrow is pressed."""
+
+    downArrowPressed = Signal()
+
+    def keyPressEvent(self, event):
+        """Handle key press events."""
+        if event.key() == Qt.Key.Key_Down:
+            self.downArrowPressed.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 class DraggableListView(QListView):
     """List view that signals when dragging starts/ends."""
 
@@ -1129,7 +1143,8 @@ class MessageWindow(QMainWindow):
         self._compose_widget = ComposeWidget(
             self, parent.db, parent.sync_manager, self.account_id,
             reply_to=reply_to, forward=forward, signature=signature,
-            font_size=parent.font_size, zoom=parent._preview_zoom
+            font_size=parent.font_size, zoom=parent._preview_zoom,
+            default_attach_dir=parent._get_default_downloads_dir()
         )
         self._compose_widget.message_sent.connect(self._on_compose_done)
         self._compose_widget.compose_cancelled.connect(self._on_compose_cancelled)
@@ -1565,9 +1580,10 @@ class MailbenchWindow(QMainWindow):
         filter_layout = QHBoxLayout()
         filter_layout.setContentsMargins(8, 4, 4, 4)
         filter_layout.addWidget(QLabel("Filter:"))
-        self._filter_entry = QLineEdit()
+        self._filter_entry = FilterLineEdit()
         self._filter_entry.textChanged.connect(self._filter_messages)
         self._filter_entry.setPlaceholderText("Type to filter...")
+        self._filter_entry.downArrowPressed.connect(self._jump_to_message_list)
         filter_layout.addWidget(self._filter_entry)
         message_layout.addLayout(filter_layout)
 
@@ -2245,6 +2261,13 @@ class MailbenchWindow(QMainWindow):
     def _clear_filter(self):
         """Clear the filter."""
         self._filter_entry.clear()
+
+    def _jump_to_message_list(self):
+        """Jump to the first message in the list when down arrow pressed in filter."""
+        if self._message_model.rowCount() > 0:
+            self._message_list.setFocus()
+            first_index = self._message_model.index(0, 0)
+            self._message_list.setCurrentIndex(first_index)
 
     def _on_message_selection_changed(self, current: QModelIndex, previous: QModelIndex):
         """Handle message selection change (keyboard navigation)."""
@@ -3179,7 +3202,8 @@ class MailbenchWindow(QMainWindow):
         self._compose_widget = ComposeWidget(
             self, self.db, self.sync_manager, self._current_account_id,
             reply_to=reply_to, forward=forward, signature=signature,
-            font_size=self.font_size, zoom=self._preview_zoom
+            font_size=self.font_size, zoom=self._preview_zoom,
+            default_attach_dir=self._get_default_downloads_dir()
         )
         self._compose_widget.message_sent.connect(self._on_compose_done)
         self._compose_widget.compose_cancelled.connect(self._on_compose_done)

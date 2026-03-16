@@ -134,7 +134,7 @@ class ComposeWidget(QWidget):
 
     def __init__(self, parent, db, sync_manager, account_id=None,
                  reply_to=None, forward=None, attachments=None, signature=None,
-                 font_size=12, zoom=100):
+                 font_size=12, zoom=100, default_attach_dir=None):
         super().__init__(parent)
         self.db = db
         self.sync_manager = sync_manager
@@ -145,6 +145,7 @@ class ComposeWidget(QWidget):
         self._signature = signature or ""
         self._font_size = font_size
         self._zoom = zoom / 100.0  # Convert percentage to factor
+        self._default_attach_dir = default_attach_dir or ""
 
         self._is_dark = False  # Always light mode
 
@@ -433,7 +434,9 @@ class ComposeWidget(QWidget):
 
     def _attach(self):
         """Add attachments."""
-        files, _ = QFileDialog.getOpenFileNames(self, "Select files to attach")
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Select files to attach", self._default_attach_dir
+        )
         for filepath in files:
             try:
                 with open(filepath, 'rb') as f:

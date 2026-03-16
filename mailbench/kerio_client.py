@@ -162,6 +162,82 @@ class KerioSession:
         except Exception:
             return ""
 
+    def upload_attachment(self, filename: str, content: bytes, content_type: str = None) -> tuple[Optional[str], Optional[str]]:
+        """Upload an attachment file and return the attachment ID.
+
+        Kerio requires attachments to be uploaded first, then referenced by ID
+        when creating the mail.
+
+        Args:
+            filename: Name of the file
+            content: File content as bytes
+            content_type: MIME type (defaults to application/octet-stream)
+
+        Returns:
+            Tuple of (attachment_id, error_message). On success, error is None.
+        """
+        if not content_type:
+            content_type = "application/octet-stream"
+
+        upload_url = f"https://{self.config.server}/webmail/api/jsonrpc/attachment-upload/"
+
+        headers = {}
+        if self.token:
+            headers["X-Token"] = self.token
+
+        # Build multipart body manually with proper headers
+        import uuid
+        boundary = f"----WebKitFormBoundary{uuid.uuid4().hex[:16]}"
+
+        body = []
+        body.append(f'--{boundary}'.encode())
+        body.append(f'Content-Disposition: form-data; name="file"; filename="{filename}"'.encode())
+        body.append(f'Content-Description: {filename}'.encode())
+        body.append(f'Content-Type: {content_type}'.encode())
+        body.append(b'')
+        body.append(content)
+        body.append(f'--{boundary}--'.encode())
+
+        multipart_body = b'\r\n'.join(body)
+        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+        headers["Content-Description"] = filename
+
+        try:
+            response = self.session.post(
+                upload_url,
+                data=multipart_body,
+                headers=headers,
+                timeout=60  # Longer timeout for file uploads
+            )
+            response.raise_for_status()
+
+            result = response.json()
+
+            # Check for error in response
+            if "error" in result:
+                error = result["error"]
+                return None, error.get("message", str(error))
+
+            # The upload response format is: {result: {fileUpload: {id: "...", ...}}}
+            res = result.get("result", {})
+            if isinstance(res, dict):
+                file_upload = res.get("fileUpload", {})
+                if isinstance(file_upload, dict) and "id" in file_upload:
+                    return str(file_upload["id"]), None
+
+            # Fallback: look for ID in other locations
+            if isinstance(res, dict):
+                for key in ["id", "attachmentId", "fileId", "uploadId"]:
+                    if key in res and res[key]:
+                        return str(res[key]), None
+
+            # Return full response for debugging
+            return None, f"Could not find attachment ID in response: {result}"
+        except requests.exceptions.HTTPError as e:
+            return None, f"HTTP {e.response.status_code}: {e.response.text[:200] if e.response.text else str(e)}"
+        except Exception as e:
+            return None, str(e)
+
 
 
 class KerioError(Exception):
@@ -738,20 +814,32 @@ class SyncManager:
                 if bcc_list:
                     mail["bcc"] = bcc_list
 
-                # Add attachments
+                # Upload and add attachments
                 if attachments:
-                    import base64
                     attachment_parts = []
                     for att in attachments:
                         content = att.get('content', b'')
                         if isinstance(content, str):
                             content = content.encode('utf-8')
-                        attachment_parts.append({
-                            "name": att.get('name', 'attachment'),
-                            "contentType": "application/octet-stream",
-                            "content": base64.b64encode(content).decode('ascii')
-                        })
-                    mail["attachments"] = attachment_parts
+                        name = att.get('name', 'attachment')
+
+                        # Upload attachment first to get an ID
+                        att_id, upload_error = session.upload_attachment(name, content)
+                        if att_id:
+                            attachment_parts.append({
+                                "id": att_id,
+                                "name": name,
+                                "contentType": "application/octet-stream"
+                            })
+                        else:
+                            # Upload failed - report error with details
+                            error_msg = upload_error or "Unknown error"
+                            self._ui_callback(callback, False,
+                                f"Failed to upload attachment: {name}\n{error_msg}")
+                            return
+
+                    if attachment_parts:
+                        mail["attachments"] = attachment_parts
 
                 result = session.call("Mails.create", {"mails": [mail]})
                 # Check for errors in result
