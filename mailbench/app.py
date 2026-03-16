@@ -145,9 +145,11 @@ def sanitize_html(html: str) -> str:
         r'\1=""', html, flags=re.IGNORECASE
     )
 
-    # Remove data: URLs (can embed scripts)
+    # Remove dangerous data: URLs (can embed scripts) but allow images
+    # Block: data:text/html, data:application/javascript, etc.
+    # Allow: data:image/png, data:image/jpeg, data:image/gif, data:image/webp, data:image/svg+xml
     html = re.sub(
-        r'(href|src)\s*=\s*["\']?\s*data:[^"\'>\s]*["\']?',
+        r'(href|src)\s*=\s*["\']?\s*data:(?!image/)[^"\'>\s]*["\']?',
         r'\1=""', html, flags=re.IGNORECASE
     )
 
@@ -577,16 +579,28 @@ class MessageDelegate(QStyledItemDelegate):
 
         # Sender and subject (middle)
         left_x = x + self.FLAG_WIDTH + 4
-        left_w = date_x - left_x - 8
+        available_w = date_x - left_x - 8
+        left_w = max(20, available_w)  # Minimum width to prevent negative
+
+        # Clip to prevent overflow on Windows - never extend past date column
+        clip_w = min(left_w, available_w) if available_w > 0 else 0
+        if clip_w > 0:
+            painter.setClipRect(left_x, y, clip_w, h)
+        else:
+            # Panel too narrow - skip drawing sender/subject
+            painter.setClipping(False)
+            painter.setPen(QPen(self.border_color))
+            painter.drawLine(rect.bottomLeft(), rect.bottomRight())
+            painter.restore()
+            return
 
         # Sender
         painter.setFont(sender_font)
         painter.setPen(QPen(sender_color))
         sender_text = msg.sender_display
         fm = QFontMetrics(sender_font)
-        if fm.horizontalAdvance(sender_text) > left_w:
-            sender_text = fm.elidedText(sender_text, Qt.TextElideMode.ElideRight, left_w)
-        painter.drawText(left_x, y + 6, left_w, 20,
+        sender_text = fm.elidedText(sender_text, Qt.TextElideMode.ElideRight, clip_w)
+        painter.drawText(left_x, y + 6, clip_w, 20,
                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, sender_text)
 
         # Subject
@@ -594,10 +608,12 @@ class MessageDelegate(QStyledItemDelegate):
         painter.setPen(QPen(subject_color))
         subject_text = msg.subject
         fm = QFontMetrics(subject_font)
-        if fm.horizontalAdvance(subject_text) > left_w:
-            subject_text = fm.elidedText(subject_text, Qt.TextElideMode.ElideRight, left_w)
-        painter.drawText(left_x, y + 26, left_w, 20,
+        subject_text = fm.elidedText(subject_text, Qt.TextElideMode.ElideRight, clip_w)
+        painter.drawText(left_x, y + 26, clip_w, 20,
                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, subject_text)
+
+        # Reset clip for border drawing
+        painter.setClipping(False)
 
         # Bottom border
         painter.setPen(QPen(self.border_color))
