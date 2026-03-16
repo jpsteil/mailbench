@@ -1107,6 +1107,9 @@ class MailbenchWindow(QMainWindow):
         # Load accounts
         QTimer.singleShot(100, self._load_accounts)
 
+        # Check for updates after startup
+        QTimer.singleShot(500, self._check_for_updates)
+
         # Auto-refresh timer (check for new mail every 10 seconds)
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self._auto_check_mail)
@@ -3117,6 +3120,96 @@ class MailbenchWindow(QMainWindow):
             f"Mailbench v{__version__}\n\nA Python email client for Kerio Connect.\n\n"
             f"Built with PySide6 (Qt6)"
         )
+
+    def _check_for_updates(self):
+        """Check for updates in background."""
+        from mailbench.version import get_pypi_version, is_newer_version
+
+        def do_check():
+            try:
+                latest = get_pypi_version()
+                if latest and is_newer_version(latest, __version__):
+                    self._update_version = latest
+            except Exception:
+                pass
+
+        def on_done():
+            version = getattr(self, '_update_version', None)
+            if version:
+                self._show_update_dialog(version)
+
+        thread = threading.Thread(target=do_check, daemon=True)
+        thread.start()
+        QTimer.singleShot(3000, on_done)
+
+    def _show_update_dialog(self, latest_version: str):
+        """Show update available dialog."""
+        result = QMessageBox.question(
+            self, "Update Available",
+            f"A new version of Mailbench is available.\n\n"
+            f"Installed: {__version__}\n"
+            f"Latest: {latest_version}\n\n"
+            f"Would you like to upgrade now?\n\n"
+            f"(This will run: pipx upgrade mailbench)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if result == QMessageBox.StandardButton.Yes:
+            self._run_upgrade()
+
+    def _run_upgrade(self):
+        """Run pipx upgrade in background."""
+        self._upgrade_result = None
+
+        def do_upgrade():
+            try:
+                result = subprocess.run(
+                    ["pipx", "upgrade", "mailbench"],
+                    capture_output=True, text=True,
+                    stdin=subprocess.DEVNULL, timeout=120)
+                if result.returncode == 0:
+                    self._upgrade_result = (True, "Mailbench has been upgraded.")
+                else:
+                    error = result.stderr or result.stdout or "Unknown error"
+                    self._upgrade_result = (False, f"Failed to upgrade:\n{error}")
+            except subprocess.TimeoutExpired:
+                self._upgrade_result = (False, "Upgrade timed out. Please upgrade manually:\n\npipx upgrade mailbench")
+            except FileNotFoundError:
+                self._upgrade_result = (False, "pipx not found. Please upgrade manually:\n\npipx upgrade mailbench")
+            except Exception as e:
+                self._upgrade_result = (False, f"Failed to upgrade:\n{e}")
+
+        def poll_result():
+            result = self._upgrade_result
+            if result is None:
+                QTimer.singleShot(500, poll_result)
+                return
+            success, message = result
+            self._statusbar.showMessage("Upgrade complete" if success else "Upgrade failed", 3000)
+            if success:
+                result = QMessageBox.question(
+                    self, "Upgrade Complete",
+                    "Mailbench has been upgraded.\n\nWould you like to restart now?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                if result == QMessageBox.StandardButton.Yes:
+                    self._restart_app()
+            else:
+                QMessageBox.warning(self, "Upgrade Failed", message)
+
+        self._statusbar.showMessage("Upgrading Mailbench...")
+        thread = threading.Thread(target=do_upgrade, daemon=True)
+        thread.start()
+        QTimer.singleShot(2000, poll_result)
+
+    def _restart_app(self):
+        """Restart the application."""
+        self._save_geometry()
+
+        if sys.argv[0].endswith('mailbench') or 'mailbench' in sys.argv[0]:
+            subprocess.Popen([sys.argv[0]])
+        else:
+            subprocess.Popen([sys.executable, '-m', 'mailbench'])
+
+        self.close()
+        os._exit(0)
 
     def closeEvent(self, event):
         """Handle window close."""
