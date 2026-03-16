@@ -1163,8 +1163,15 @@ class MailbenchWindow(QMainWindow):
         # Load accounts
         QTimer.singleShot(100, self._load_accounts)
 
-        # Check for updates after startup
-        QTimer.singleShot(500, self._check_for_updates)
+        # Update notification button (hidden until update available)
+        self._update_btn = None
+        self._available_version = None
+
+        # Check for updates after startup, then every hour
+        QTimer.singleShot(2000, self._check_for_updates)
+        self._update_timer = QTimer(self)
+        self._update_timer.timeout.connect(self._check_for_updates)
+        self._update_timer.start(3600000)  # 1 hour
 
         # Auto-refresh timer (check for new mail every 10 seconds)
         self._refresh_timer = QTimer(self)
@@ -3239,34 +3246,64 @@ class MailbenchWindow(QMainWindow):
 
     def _check_for_updates(self):
         """Check for updates in background."""
-        from mailbench.version import get_pypi_version, is_newer_version
+        # Skip if we already found an update
+        if self._available_version:
+            return
+
+        from mailbench.version import get_pypi_version, is_newer_version, __version__ as installed_version
 
         def do_check():
             try:
                 latest = get_pypi_version()
-                if latest and is_newer_version(latest, __version__):
-                    self._update_version = latest
+                if latest and is_newer_version(latest, installed_version):
+                    self._available_version = latest
             except Exception:
                 pass
 
         def on_done():
-            version = getattr(self, '_update_version', None)
-            if version:
-                self._show_update_dialog(version)
+            if self._available_version and not self._update_btn:
+                self._show_update_button()
 
         thread = threading.Thread(target=do_check, daemon=True)
         thread.start()
         QTimer.singleShot(3000, on_done)
 
-    def _show_update_dialog(self, latest_version: str):
-        """Show update available dialog."""
+    def _show_update_button(self):
+        """Show upgrade button on menu bar."""
+        if self._update_btn:
+            return
+
+        self._update_btn = QPushButton(f"⬆ Upgrade to v{self._available_version}")
+        self._update_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #28a745;
+                color: white;
+                border: none;
+                padding: 4px 12px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #218838;
+            }
+            QPushButton:pressed {
+                background-color: #1e7e34;
+            }
+        """)
+        self._update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._update_btn.clicked.connect(self._on_upgrade_clicked)
+
+        # Add to menu bar corner
+        self.menuBar().setCornerWidget(self._update_btn, Qt.Corner.TopRightCorner)
+        self._update_btn.show()
+        self.menuBar().update()
+
+    def _on_upgrade_clicked(self):
+        """Handle upgrade button click."""
         result = QMessageBox.question(
-            self, "Update Available",
-            f"A new version of Mailbench is available.\n\n"
-            f"Installed: {__version__}\n"
-            f"Latest: {latest_version}\n\n"
-            f"Would you like to upgrade now?\n\n"
-            f"(This will run: pipx upgrade mailbench)",
+            self, "Upgrade Mailbench",
+            f"Upgrade to Mailbench v{self._available_version}?\n\n"
+            f"The application will restart after upgrading.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if result == QMessageBox.StandardButton.Yes:
             self._run_upgrade()
@@ -3274,6 +3311,21 @@ class MailbenchWindow(QMainWindow):
     def _run_upgrade(self):
         """Run pipx upgrade in background."""
         self._upgrade_result = None
+
+        # Update button to show progress
+        if self._update_btn:
+            self._update_btn.setText("⏳ Upgrading...")
+            self._update_btn.setEnabled(False)
+            self._update_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #6c757d;
+                    color: white;
+                    border: none;
+                    padding: 4px 12px;
+                    border-radius: 4px;
+                    font-weight: bold;
+                }
+            """)
 
         def do_upgrade():
             try:
@@ -3301,6 +3353,9 @@ class MailbenchWindow(QMainWindow):
             success, message = result
             self._statusbar.showMessage("Upgrade complete" if success else "Upgrade failed", 3000)
             if success:
+                # Hide the update button
+                if self._update_btn:
+                    self._update_btn.hide()
                 result = QMessageBox.question(
                     self, "Upgrade Complete",
                     "Mailbench has been upgraded.\n\nWould you like to restart now?",
@@ -3308,6 +3363,23 @@ class MailbenchWindow(QMainWindow):
                 if result == QMessageBox.StandardButton.Yes:
                     self._restart_app()
             else:
+                # Re-enable button on failure
+                if self._update_btn:
+                    self._update_btn.setText(f"⬆ Upgrade to v{self._available_version}")
+                    self._update_btn.setEnabled(True)
+                    self._update_btn.setStyleSheet("""
+                        QPushButton {
+                            background-color: #28a745;
+                            color: white;
+                            border: none;
+                            padding: 4px 12px;
+                            border-radius: 4px;
+                            font-weight: bold;
+                        }
+                        QPushButton:hover {
+                            background-color: #218838;
+                        }
+                    """)
                 QMessageBox.warning(self, "Upgrade Failed", message)
 
         self._statusbar.showMessage("Upgrading Mailbench...")
