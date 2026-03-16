@@ -2231,11 +2231,12 @@ class MailbenchWindow(QMainWindow):
 
         self._message_model.add_messages(messages)
 
-        # Auto-select first message
+        # Auto-select first message and focus list for keyboard navigation
         if self._message_model.rowCount() > 0:
             first_index = self._message_model.index(0)
             self._message_list.setCurrentIndex(first_index)
             self._on_message_clicked(first_index)
+        self._message_list.setFocus()
 
     def _filter_messages(self, text: str):
         """Filter messages by search text."""
@@ -3140,6 +3141,7 @@ class MailbenchWindow(QMainWindow):
         """Handle message moved."""
         if success:
             self._message_model.remove_message(item_id)
+            self._message_list.setFocus()
         else:
             self._statusbar.showMessage(f"Move failed: {error}")
 
@@ -3203,6 +3205,8 @@ class MailbenchWindow(QMainWindow):
             self._preview_stack.removeWidget(self._compose_widget)
             self._compose_widget.deleteLater()
             self._compose_widget = None
+
+        self._message_list.setFocus()
 
     def _new_message(self):
         """Create new message."""
@@ -3322,6 +3326,7 @@ class MailbenchWindow(QMainWindow):
                     self._preview_body.setHtml("<html><body></body></html>")
                 else:
                     self._preview_body.clear()
+            self._message_list.setFocus()
         else:
             self._statusbar.showMessage(f"Delete failed: {error}")
 
@@ -3403,6 +3408,7 @@ class MailbenchWindow(QMainWindow):
         dialog = AccountDialog(self, self.db, self.kerio_pool, app=self)
         dialog.exec()
         self._refresh_accounts()
+        self._message_list.setFocus()
 
     def _manage_accounts(self):
         """Manage accounts."""
@@ -3410,6 +3416,7 @@ class MailbenchWindow(QMainWindow):
         dialog = AccountDialog(self, self.db, self.kerio_pool, app=self)
         dialog.exec()
         self._refresh_accounts()
+        self._message_list.setFocus()
 
     def _refresh_accounts(self):
         """Refresh account list after changes."""
@@ -3424,6 +3431,7 @@ class MailbenchWindow(QMainWindow):
         from mailbench.dialogs.dialogs import SettingsDialog
         dialog = SettingsDialog(self, self.db, self)
         dialog.exec()
+        self._message_list.setFocus()
 
     def _show_about(self):
         """Show about dialog."""
@@ -3681,6 +3689,7 @@ class MailbenchWindow(QMainWindow):
         from mailbench.dialogs.blocklist_dialog import BlocklistDialog
         dialog = BlocklistDialog(self.blocklist_manager, self)
         dialog.exec()
+        self._message_list.setFocus()
 
     def _initialize_blocklist(self, account_id: int):
         """Initialize blocklist for an account after connecting."""
