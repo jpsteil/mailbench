@@ -2997,28 +2997,32 @@ class MailbenchWindow(QMainWindow):
     def _on_message_deleted(self, success: bool, error: str, item_id: str, select_row: int = -1):
         """Handle message deletion."""
         if success:
+            # Get current selection before removing
+            current_index = self._message_list.currentIndex()
+            current_row = current_index.row() if current_index.isValid() else select_row
+
             self._message_model.remove_message(item_id)
 
-            # Select next message
-            if select_row >= 0:
-                row_count = self._message_model.rowCount()
-                if row_count > 0:
-                    # If we were at the last item, select the new last item
-                    new_row = min(select_row, row_count - 1)
-                    new_index = self._message_model.index(new_row)
-                    self._message_list.setCurrentIndex(new_index)
-                    self._on_message_clicked(new_index)
+            # Always select next available message
+            row_count = self._message_model.rowCount()
+            if row_count > 0:
+                # Use the row we were at, clamped to valid range
+                target_row = current_row if current_row >= 0 else select_row
+                new_row = min(max(0, target_row), row_count - 1)
+                new_index = self._message_model.index(new_row)
+                self._message_list.setCurrentIndex(new_index)
+                self._on_message_clicked(new_index)
+            else:
+                # No messages left, clear preview
+                self._current_message_id = None
+                self._preview_from.setText("From:")
+                self._preview_to.setText("To:")
+                self._preview_subject.setText("")
+                self._preview_date.setText("")
+                if self._use_webengine:
+                    self._preview_body.setHtml("<html><body></body></html>")
                 else:
-                    # No messages left, clear preview
-                    self._current_message_id = None
-                    self._preview_from.setText("From:")
-                    self._preview_to.setText("To:")
-                    self._preview_subject.setText("")
-                    self._preview_date.setText("")
-                    if self._use_webengine:
-                        self._preview_body.setHtml("<html><body></body></html>")
-                    else:
-                        self._preview_body.clear()
+                    self._preview_body.clear()
         else:
             self._statusbar.showMessage(f"Delete failed: {error}")
 
