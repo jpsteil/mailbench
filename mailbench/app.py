@@ -27,16 +27,17 @@ except ImportError:
 from PySide6.QtCore import (
     Qt, QAbstractListModel, QModelIndex, QSize, Signal, Slot,
     QTimer, QThread, QObject, QSettings, QMetaObject, Q_ARG, QGenericArgument,
-    QEvent
+    QEvent, QPoint
 )
 from PySide6.QtGui import (
     QFont, QFontMetrics, QPainter, QColor, QPen, QBrush, QAction,
     QStandardItemModel, QStandardItem, QPalette, QIcon, QKeySequence,
-    QShortcut, QPixmap
+    QShortcut, QPixmap, QDrag
 )
 
 from mailbench.database import Database
 from mailbench.kerio_client import KerioConnectionPool, SyncManager, KerioConfig
+from mailbench.blocklist import BlocklistManager
 from mailbench.version import __version__
 
 
@@ -810,6 +811,126 @@ class FolderTreeModel(QStandardItemModel):
         return True
 
 
+class DraggableListView(QListView):
+    """List view that signals when dragging starts/ends."""
+
+    dragStarted = Signal()
+    dragEnded = Signal()
+
+    def startDrag(self, supportedActions):
+        """Override to create drag with offset hotspot so cursor stays visible."""
+        indexes = self.selectedIndexes()
+        if not indexes:
+            return
+
+        self.dragStarted.emit()
+
+        # Get mime data from model
+        mime_data = self.model().mimeData(indexes)
+        if not mime_data:
+            self.dragEnded.emit()
+            return
+
+        # Create drag with small indicator pixmap instead of full row
+        # This keeps the cursor area clear for seeing drop targets
+        drag = QDrag(self)
+        drag.setMimeData(mime_data)
+
+        count = len(indexes)
+        label = f"{count} message{'s' if count > 1 else ''}"
+
+        # Create pixmap with label
+        font = self.font()
+        fm = QFontMetrics(font)
+        text_width = fm.horizontalAdvance(label) + 16
+        text_height = fm.height() + 8
+
+        pixmap = QPixmap(text_width, text_height)
+        pixmap.fill(QColor(70, 130, 180, 200))  # Steel blue, semi-transparent
+
+        painter = QPainter(pixmap)
+        painter.setPen(QColor(255, 255, 255))
+        painter.setFont(font)
+        painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, label)
+        painter.end()
+
+        drag.setPixmap(pixmap)
+        # Offset hotspot so pixmap appears below and right of cursor
+        drag.setHotSpot(QPoint(-10, -10))
+
+        # Execute drag
+        drag.exec(supportedActions)
+
+        self.dragEnded.emit()
+
+
+class BlockDropZone(QLabel):
+    """Drop zone for blocking email senders."""
+
+    itemDropped = Signal(str, bool)  # sender_email, is_domain
+
+    def __init__(self, text: str, is_domain: bool = False, parent=None):
+        super().__init__(text, parent)
+        self.is_domain = is_domain
+        self.setAcceptDrops(True)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumHeight(32)
+        self._update_style(False)
+
+    def _update_style(self, highlight: bool):
+        """Update visual style based on drag state."""
+        if highlight:
+            self.setStyleSheet("""
+                QLabel {
+                    background-color: #ffcccc;
+                    border: 2px dashed #cc0000;
+                    border-radius: 4px;
+                    padding: 4px;
+                    font-weight: bold;
+                }
+            """)
+        else:
+            self.setStyleSheet("""
+                QLabel {
+                    background-color: #f0f0f0;
+                    border: 1px solid #ccc;
+                    border-radius: 4px;
+                    padding: 4px;
+                }
+            """)
+
+    def dragEnterEvent(self, event):
+        """Handle drag enter - accept if it's a message."""
+        if event.mimeData().hasFormat("application/x-mailbench-message"):
+            event.acceptProposedAction()
+            self._update_style(True)
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        """Handle drag leave - remove highlight."""
+        self._update_style(False)
+
+    def dropEvent(self, event):
+        """Handle drop - extract sender and emit signal."""
+        self._update_style(False)
+
+        data = event.mimeData()
+        if not data.hasFormat("application/x-mailbench-message"):
+            return
+
+        # Get the sender email from the dropped data
+        # The MIME data contains message IDs, we need to look up the sender
+        raw_data = data.data("application/x-mailbench-message").data().decode()
+        item_ids = [id.strip() for id in raw_data.split(",") if id.strip()]
+
+        if item_ids:
+            # Emit with first item ID - parent will look up sender
+            self.itemDropped.emit(item_ids[0], self.is_domain)
+
+        event.acceptProposedAction()
+
+
 class MessageWindow(QMainWindow):
     """Separate window for viewing a message."""
 
@@ -1121,6 +1242,8 @@ class MailbenchWindow(QMainWindow):
             print(f"Migrated {migrated} password(s) to secure keyring storage")
         self.kerio_pool = KerioConnectionPool()
         self.sync_manager = SyncManager(self.kerio_pool, self.db, self)
+        self.blocklist_manager = BlocklistManager(self.db, self.sync_manager)
+        self._junk_folder_id: Optional[str] = None
 
         # Track state
         self.connected_accounts: set[int] = set()
@@ -1177,6 +1300,7 @@ class MailbenchWindow(QMainWindow):
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self._auto_check_mail)
         self._refresh_timer.start(10000)  # 10 seconds
+        self._refresh_count = 0  # Counter for periodic folder sync
 
     @Slot(object)
     def _execute_callback(self, callback):
@@ -1261,6 +1385,10 @@ class MailbenchWindow(QMainWindow):
         settings_action = QAction("&Settings...", self)
         settings_action.triggered.connect(self._show_settings)
         file_menu.addAction(settings_action)
+
+        blocked_senders_action = QAction("Blocked &Senders...", self)
+        blocked_senders_action.triggered.connect(self._show_blocklist_dialog)
+        file_menu.addAction(blocked_senders_action)
 
         file_menu.addSeparator()
 
@@ -1401,6 +1529,26 @@ class MailbenchWindow(QMainWindow):
         self._folder_tree.customContextMenuRequested.connect(self._show_folder_context_menu)
         folder_layout.addWidget(self._folder_tree)
 
+        # Block drop zones at bottom of folder tree (hidden until drag starts)
+        self._block_frame = QFrame()
+        self._block_frame.setFrameStyle(QFrame.Shape.StyledPanel)
+        block_layout = QVBoxLayout(self._block_frame)
+        block_layout.setContentsMargins(4, 4, 4, 4)
+        block_layout.setSpacing(4)
+
+        # Block Domain drop zone
+        self._block_domain_zone = BlockDropZone("🚫 Block Domain", is_domain=True)
+        self._block_domain_zone.itemDropped.connect(self._on_block_drop)
+        block_layout.addWidget(self._block_domain_zone)
+
+        # Block Email drop zone
+        self._block_email_zone = BlockDropZone("🚫 Block Email", is_domain=False)
+        self._block_email_zone.itemDropped.connect(self._on_block_drop)
+        block_layout.addWidget(self._block_email_zone)
+
+        self._block_frame.hide()  # Hidden by default, shown during drag
+        folder_layout.addWidget(self._block_frame)
+
         folder_widget.setMinimumWidth(100)
         self._splitter.addWidget(folder_widget)
 
@@ -1428,7 +1576,7 @@ class MailbenchWindow(QMainWindow):
         self._message_delegate = MessageDelegate(dark_mode=False, font_size=self.font_size)
         self._message_delegate.flagClicked.connect(self._on_flag_clicked)
 
-        self._message_list = QListView()
+        self._message_list = DraggableListView()
         self._message_list.setModel(self._message_model)
         self._message_list.setItemDelegate(self._message_delegate)
         self._message_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -1441,6 +1589,9 @@ class MailbenchWindow(QMainWindow):
         # Enable drag
         self._message_list.setDragEnabled(True)
         self._message_list.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
+        # Connect drag signals to show/hide block drop zones
+        self._message_list.dragStarted.connect(self._show_block_zones)
+        self._message_list.dragEnded.connect(self._hide_block_zones)
         # Handle keyboard navigation
         self._message_list.selectionModel().currentChanged.connect(self._on_message_selection_changed)
         message_layout.addWidget(self._message_list)
@@ -1797,6 +1948,8 @@ class MailbenchWindow(QMainWindow):
             self._load_folders(account_id)
             self._load_address_book(account_id)
             self._load_signature(account_id)
+            # Initialize blocklist system
+            self._initialize_blocklist(account_id)
             # Start listening for mailbox changes (push notifications)
             self.sync_manager.start_change_listener(
                 account_id,
@@ -2052,8 +2205,18 @@ class MailbenchWindow(QMainWindow):
 
         def on_messages_synced(success, error=None, messages_data=None):
             if success and messages_data:
-                self._display_messages(messages_data)
-                self._statusbar.showMessage(f"{len(messages_data)} messages")
+                # Filter out blocked senders
+                filtered_messages, blocked_msgs = self._filter_blocked_messages(
+                    messages_data, account_id
+                )
+                self._display_messages(filtered_messages)
+                msg_count = len(filtered_messages)
+                if blocked_msgs:
+                    self._statusbar.showMessage(
+                        f"{msg_count} messages ({len(blocked_msgs)} blocked)"
+                    )
+                else:
+                    self._statusbar.showMessage(f"{msg_count} messages")
             elif error:
                 self._statusbar.showMessage(f"Error: {error}")
 
@@ -2817,6 +2980,23 @@ class MailbenchWindow(QMainWindow):
                     action = move_menu.addAction(folder_name)
                     action.triggered.connect(lambda checked, fid=folder_id: self._move_to_folder(fid))
 
+        # Block Sender submenu
+        if msg and msg.sender_email:
+            block_menu = menu.addMenu("Block Sender")
+            sender_email = msg.sender_email
+            domain = sender_email.split('@')[1] if '@' in sender_email else None
+
+            block_email_action = block_menu.addAction(f"Block email: {sender_email}")
+            block_email_action.triggered.connect(
+                lambda: self._block_sender(sender_email, is_domain=False)
+            )
+
+            if domain:
+                block_domain_action = block_menu.addAction(f"Block domain: {domain}")
+                block_domain_action.triggered.connect(
+                    lambda: self._block_sender(domain, is_domain=True)
+                )
+
         menu.addSeparator()
 
         # Delete
@@ -3146,8 +3326,11 @@ class MailbenchWindow(QMainWindow):
             self._statusbar.showMessage(f"Delete failed: {error}")
 
     def _check_mail(self):
-        """Refresh current folder (full refresh, clears preview)."""
+        """Refresh current folder and folders list (full refresh, clears preview)."""
         if self._current_account_id and self._current_folder_id:
+            # Sync folders first to catch any deleted/added folders
+            self._load_folders(self._current_account_id)
+            # Then refresh messages
             self._load_messages(self._current_account_id, self._current_folder_id)
 
     def _auto_check_mail(self):
@@ -3156,6 +3339,12 @@ class MailbenchWindow(QMainWindow):
             return
         if self._current_account_id not in self.connected_accounts:
             return
+
+        # Periodic folder sync (every 30 refreshes = 5 minutes)
+        self._refresh_count += 1
+        if self._refresh_count >= 30:
+            self._refresh_count = 0
+            self._load_folders(self._current_account_id)
 
         # Remember current selection
         current_selection = self._current_message_id
@@ -3400,8 +3589,163 @@ class MailbenchWindow(QMainWindow):
         self.close()
         os._exit(0)
 
+    # ==================== Blocklist ====================
+
+    def _show_block_zones(self):
+        """Show block drop zones when dragging starts."""
+        self._block_frame.show()
+
+    def _hide_block_zones(self):
+        """Hide block drop zones when dragging ends."""
+        self._block_frame.hide()
+
+    def _on_block_drop(self, item_id: str, is_domain: bool):
+        """Handle drop on block zone."""
+        # Look up the sender email from the message
+        msg_data = self._messages_by_id.get(item_id)
+        if not msg_data:
+            return
+
+        sender_email = msg_data.get('sender_email', '')
+        if not sender_email:
+            return
+
+        if is_domain and '@' in sender_email:
+            value = sender_email.split('@')[1]
+        else:
+            value = sender_email
+
+        self._block_sender(value, is_domain)
+
+    def _block_sender(self, value: str, is_domain: bool):
+        """Block a sender email or domain."""
+        if not self._current_account_id:
+            return
+
+        type_label = "domain" if is_domain else "email"
+
+        def on_blocked(success, error):
+            if success:
+                self._statusbar.showMessage(f"Blocked {type_label}: {value}", 3000)
+                # Optionally scan current folder for matches
+                self._scan_folder_for_blocked()
+            else:
+                self._statusbar.showMessage(f"Failed to block {type_label}: {error}", 5000)
+
+        if is_domain:
+            self.blocklist_manager.add_domain(value, on_blocked)
+        else:
+            self.blocklist_manager.add_email(value, on_blocked)
+
+    def _scan_folder_for_blocked(self):
+        """Scan current folder and move blocked messages to Junk."""
+        if not self._current_account_id or not self._current_folder_id:
+            return
+        if not self._junk_folder_id:
+            return
+
+        # Check each message in current view
+        messages_to_move = []
+        for item_id, msg_data in self._messages_by_id.items():
+            sender_email = msg_data.get('sender_email', '')
+            is_blocked, match_type = self.blocklist_manager.is_blocked(sender_email)
+            if is_blocked:
+                messages_to_move.append((item_id, sender_email, match_type))
+
+        if not messages_to_move:
+            return
+
+        # Move messages to Junk folder
+        for item_id, sender_email, match_type in messages_to_move:
+            def on_moved(success, error, iid=item_id, email=sender_email, mtype=match_type):
+                if success:
+                    # Increment blocked count
+                    if mtype == 'domain' and '@' in email:
+                        self.blocklist_manager.increment_blocked(email.split('@')[1], True)
+                    else:
+                        self.blocklist_manager.increment_blocked(email, False)
+
+            self.sync_manager.move_message(
+                self._current_account_id, item_id,
+                self._junk_folder_id, on_moved
+            )
+
+        # Refresh folder view
+        self._statusbar.showMessage(f"Moving {len(messages_to_move)} blocked message(s) to Junk...", 3000)
+        QTimer.singleShot(1000, lambda: self._on_folder_selected(
+            self._current_account_id, self._current_folder_id
+        ))
+
+    def _show_blocklist_dialog(self):
+        """Show the blocked senders management dialog."""
+        from mailbench.dialogs.blocklist_dialog import BlocklistDialog
+        dialog = BlocklistDialog(self.blocklist_manager, self)
+        dialog.exec()
+
+    def _initialize_blocklist(self, account_id: int):
+        """Initialize blocklist for an account after connecting."""
+        def on_blocklist_init(success, error):
+            if success:
+                # Start periodic sync
+                self.blocklist_manager.start_periodic_sync()
+                # Get the Junk folder for blocked messages
+                self.sync_manager.get_junk_folder(
+                    account_id, self._on_junk_folder_ready
+                )
+            else:
+                print(f"Blocklist init failed: {error}")
+
+        # Get user's email to add their domain to allowed list
+        account = self.db.get_account(account_id)
+        user_email = account.get('email') if account else None
+        self.blocklist_manager.initialize(account_id, user_email, on_blocklist_init)
+
+    def _on_junk_folder_ready(self, success, error, folder_id):
+        """Called when Junk folder is ready."""
+        if success and folder_id:
+            self._junk_folder_id = folder_id
+
+    def _filter_blocked_messages(self, messages: list, account_id: int) -> tuple[list, list]:
+        """Filter out blocked senders and move their messages.
+
+        Returns (filtered_messages, blocked_messages).
+        """
+        if not self._junk_folder_id:
+            return messages, []
+
+        filtered = []
+        blocked = []
+
+        for msg in messages:
+            sender_email = msg.get('sender_email', '')
+            is_blocked, match_type = self.blocklist_manager.is_blocked(sender_email)
+
+            if is_blocked:
+                blocked.append(msg)
+                # Move to Junk folder
+                item_id = msg.get('item_id')
+                if item_id:
+                    self.sync_manager.move_message(
+                        account_id, item_id, self._junk_folder_id
+                    )
+                    # Increment blocked count
+                    if match_type == 'domain' and '@' in sender_email:
+                        self.blocklist_manager.increment_blocked(
+                            sender_email.split('@')[1], True
+                        )
+                    else:
+                        self.blocklist_manager.increment_blocked(sender_email, False)
+            else:
+                filtered.append(msg)
+
+        return filtered, blocked
+
     def closeEvent(self, event):
         """Handle window close."""
+        # Save blocklist data to server before closing
+        self.blocklist_manager.save_all()
+        self.blocklist_manager.stop_periodic_sync()
+
         # Capture actual zoom from WebEngineView before closing
         if HAS_WEBENGINE and isinstance(self._preview_body, QWebEngineView):
             actual_zoom = int(self._preview_body.zoomFactor() * 100)

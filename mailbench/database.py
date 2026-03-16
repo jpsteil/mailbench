@@ -233,6 +233,37 @@ class Database:
                 )
             """)
 
+            # Blocklist - blocked domains
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS blocked_domains (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    domain TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    blocked_count INTEGER DEFAULT 0,
+                    last_blocked TIMESTAMP,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Blocklist - blocked email addresses
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS blocked_emails (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    blocked_count INTEGER DEFAULT 0,
+                    last_blocked TIMESTAMP,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Allowed domains - cannot be blocked at domain level
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS allowed_domains (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    domain TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
             conn.commit()
 
     # ==================== Settings ====================
@@ -750,4 +781,233 @@ class Database:
                     INSERT OR IGNORE INTO email_cache (email, name, send_count, last_used)
                     VALUES (?, ?, 0, CURRENT_TIMESTAMP)
                 """, (email, name))
+            conn.commit()
+
+    # ==================== Blocklist ====================
+
+    def get_blocked_domains(self) -> list:
+        """Get all blocked domains."""
+        with self._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("""
+                SELECT id, domain, blocked_count, last_blocked, added_at
+                FROM blocked_domains
+                ORDER BY domain
+            """)
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_blocked_emails(self) -> list:
+        """Get all blocked email addresses."""
+        with self._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("""
+                SELECT id, email, blocked_count, last_blocked, added_at
+                FROM blocked_emails
+                ORDER BY email
+            """)
+            return [dict(row) for row in cursor.fetchall()]
+
+    def add_blocked_domain(self, domain: str) -> bool:
+        """Add a domain to blocklist. Returns True if added, False if already exists."""
+        domain = domain.strip().lower()
+        if not domain:
+            return False
+        with self._get_conn() as conn:
+            try:
+                conn.execute("""
+                    INSERT INTO blocked_domains (domain)
+                    VALUES (?)
+                """, (domain,))
+                conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def add_blocked_email(self, email: str) -> bool:
+        """Add an email to blocklist. Returns True if added, False if already exists."""
+        email = email.strip().lower()
+        if not email:
+            return False
+        with self._get_conn() as conn:
+            try:
+                conn.execute("""
+                    INSERT INTO blocked_emails (email)
+                    VALUES (?)
+                """, (email,))
+                conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def remove_blocked_domain(self, domain: str):
+        """Remove a domain from blocklist."""
+        with self._get_conn() as conn:
+            conn.execute(
+                "DELETE FROM blocked_domains WHERE domain = ? COLLATE NOCASE",
+                (domain,)
+            )
+            conn.commit()
+
+    def remove_blocked_email(self, email: str):
+        """Remove an email from blocklist."""
+        with self._get_conn() as conn:
+            conn.execute(
+                "DELETE FROM blocked_emails WHERE email = ? COLLATE NOCASE",
+                (email,)
+            )
+            conn.commit()
+
+    def is_blocked(self, sender_email: str) -> tuple[bool, str]:
+        """Check if a sender is blocked (by email or domain).
+
+        Returns (is_blocked, match_type) where match_type is 'email', 'domain', or None.
+        """
+        if not sender_email:
+            return False, None
+        sender_email = sender_email.strip().lower()
+
+        # Check email first (more specific)
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                "SELECT 1 FROM blocked_emails WHERE email = ? COLLATE NOCASE",
+                (sender_email,)
+            )
+            if cursor.fetchone():
+                return True, 'email'
+
+            # Check domain
+            if '@' in sender_email:
+                domain = sender_email.split('@')[1]
+                cursor = conn.execute(
+                    "SELECT 1 FROM blocked_domains WHERE domain = ? COLLATE NOCASE",
+                    (domain,)
+                )
+                if cursor.fetchone():
+                    return True, 'domain'
+
+        return False, None
+
+    def increment_blocked_count(self, value: str, is_domain: bool):
+        """Increment blocked count and update last_blocked timestamp."""
+        table = "blocked_domains" if is_domain else "blocked_emails"
+        column = "domain" if is_domain else "email"
+        with self._get_conn() as conn:
+            conn.execute(f"""
+                UPDATE {table}
+                SET blocked_count = blocked_count + 1,
+                    last_blocked = CURRENT_TIMESTAMP
+                WHERE {column} = ? COLLATE NOCASE
+            """, (value,))
+            conn.commit()
+
+    def clear_blocklist(self):
+        """Clear all blocklist entries (used before syncing from server)."""
+        with self._get_conn() as conn:
+            conn.execute("DELETE FROM blocked_domains")
+            conn.execute("DELETE FROM blocked_emails")
+            conn.commit()
+
+    def bulk_add_blocked_domains(self, entries: list):
+        """Bulk add blocked domains from server sync.
+
+        entries: list of dicts with 'value', 'blocked_count', 'last_blocked'
+        """
+        with self._get_conn() as conn:
+            for entry in entries:
+                domain = entry.get('value', '').strip().lower()
+                if not domain:
+                    continue
+                conn.execute("""
+                    INSERT OR REPLACE INTO blocked_domains
+                    (domain, blocked_count, last_blocked)
+                    VALUES (?, ?, ?)
+                """, (domain, entry.get('blocked_count', 0), entry.get('last_blocked')))
+            conn.commit()
+
+    def bulk_add_blocked_emails(self, entries: list):
+        """Bulk add blocked emails from server sync.
+
+        entries: list of dicts with 'value', 'blocked_count', 'last_blocked'
+        """
+        with self._get_conn() as conn:
+            for entry in entries:
+                email = entry.get('value', '').strip().lower()
+                if not email:
+                    continue
+                conn.execute("""
+                    INSERT OR REPLACE INTO blocked_emails
+                    (email, blocked_count, last_blocked)
+                    VALUES (?, ?, ?)
+                """, (email, entry.get('blocked_count', 0), entry.get('last_blocked')))
+            conn.commit()
+
+    # ==================== Allowed Domains ====================
+
+    def get_allowed_domains(self) -> list:
+        """Get all allowed domains (cannot be blocked at domain level)."""
+        with self._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("""
+                SELECT id, domain, added_at
+                FROM allowed_domains
+                ORDER BY domain
+            """)
+            return [dict(row) for row in cursor.fetchall()]
+
+    def add_allowed_domain(self, domain: str) -> bool:
+        """Add a domain to allowed list. Returns True if added."""
+        domain = domain.strip().lower()
+        if not domain:
+            return False
+        with self._get_conn() as conn:
+            try:
+                conn.execute("""
+                    INSERT INTO allowed_domains (domain)
+                    VALUES (?)
+                """, (domain,))
+                conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def remove_allowed_domain(self, domain: str):
+        """Remove a domain from allowed list."""
+        with self._get_conn() as conn:
+            conn.execute(
+                "DELETE FROM allowed_domains WHERE domain = ? COLLATE NOCASE",
+                (domain,)
+            )
+            conn.commit()
+
+    def is_allowed_domain(self, domain: str) -> bool:
+        """Check if a domain is in the allowed list."""
+        if not domain:
+            return False
+        domain = domain.strip().lower()
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                "SELECT 1 FROM allowed_domains WHERE domain = ? COLLATE NOCASE",
+                (domain,)
+            )
+            return cursor.fetchone() is not None
+
+    def clear_allowed_domains(self):
+        """Clear all allowed domain entries."""
+        with self._get_conn() as conn:
+            conn.execute("DELETE FROM allowed_domains")
+            conn.commit()
+
+    def bulk_add_allowed_domains(self, domains: list):
+        """Bulk add allowed domains from server sync."""
+        with self._get_conn() as conn:
+            for domain in domains:
+                if isinstance(domain, dict):
+                    domain = domain.get('value', '')
+                domain = domain.strip().lower() if domain else ''
+                if not domain:
+                    continue
+                conn.execute("""
+                    INSERT OR IGNORE INTO allowed_domains (domain)
+                    VALUES (?)
+                """, (domain,))
             conn.commit()

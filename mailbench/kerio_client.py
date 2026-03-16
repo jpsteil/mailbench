@@ -299,6 +299,8 @@ class SyncManager:
             return "junk"
         elif folder_type == "outbox" or "outbox" in name_lower:
             return "outbox"
+        elif name_lower == "quarantine":
+            return "quarantine"
         return "custom"
 
     def sync_messages(self, account_id: int, folder_id: str, limit: int = -1,
@@ -983,3 +985,257 @@ class SyncManager:
         for account_id in list(self._change_listeners.keys()):
             self._change_listeners[account_id] = False
         self.executor.shutdown(wait=False, cancel_futures=True)
+
+    # ==================== Folder Management ====================
+
+    def create_folder(self, account_id: int, name: str, parent_id: str = None,
+                      callback: Optional[Callable] = None):
+        """Create a new mail folder."""
+        def do_create():
+            try:
+                session = self.pool.get_session(account_id)
+                if not session:
+                    self._ui_callback(callback, False, "Account not connected", None)
+                    return
+
+                folder_data = {
+                    "name": name,
+                    "type": "fmail"  # Mail folder type
+                }
+                if parent_id:
+                    folder_data["parentId"] = parent_id
+
+                result = session.call("Folders.create", {"folders": [folder_data]})
+
+                # Get created folder ID
+                created = result.get("result", [])
+                if created and len(created) > 0:
+                    folder_id = created[0].get("id", "")
+                    self._ui_callback(callback, True, None, folder_id)
+                else:
+                    self._ui_callback(callback, True, None, None)
+
+            except Exception as e:
+                self._ui_callback(callback, False, str(e), None)
+
+        self.executor.submit(do_create)
+
+    def get_junk_folder(self, account_id: int,
+                        callback: Optional[Callable] = None):
+        """Get the Junk/Spam folder ID for blocked messages."""
+        def do_get():
+            try:
+                session = self.pool.get_session(account_id)
+                if not session:
+                    self._ui_callback(callback, False, "Account not connected", None)
+                    return
+
+                result = session.call("Folders.get")
+                folders = result.get("list", [])
+
+                # Look for junk/spam folder
+                for folder in folders:
+                    name = folder.get("name", "").lower()
+                    folder_type = folder.get("type", "").lower()
+                    if folder_type == "fjunk" or "junk" in name or "spam" in name:
+                        self._ui_callback(callback, True, None, folder.get("id"))
+                        return
+
+                self._ui_callback(callback, False, "Junk folder not found", None)
+
+            except Exception as e:
+                self._ui_callback(callback, False, str(e), None)
+
+        self.executor.submit(do_get)
+
+    # ==================== Notes API ====================
+
+    def get_notes_folder_id(self, account_id: int, callback: Optional[Callable] = None):
+        """Find the Notes folder ID for an account."""
+        def do_fetch():
+            try:
+                session = self.pool.get_session(account_id)
+                if not session:
+                    self._ui_callback(callback, False, "Account not connected", None)
+                    return
+
+                result = session.call("Folders.get")
+                folders = result.get("list", [])
+
+                # Look for notes folder (type "fnotes" or name "Notes")
+                for folder in folders:
+                    folder_type = folder.get("type", "").lower()
+                    folder_name = folder.get("name", "").lower()
+                    if folder_type == "fnotes" or folder_name == "notes":
+                        self._ui_callback(callback, True, None, folder.get("id"))
+                        return
+
+                self._ui_callback(callback, False, "Notes folder not found", None)
+
+            except Exception as e:
+                self._ui_callback(callback, False, str(e), None)
+
+        self.executor.submit(do_fetch)
+
+    def fetch_notes(self, account_id: int, folder_id: str,
+                    callback: Optional[Callable] = None):
+        """Fetch all notes from a notes folder."""
+        def do_fetch():
+            try:
+                session = self.pool.get_session(account_id)
+                if not session:
+                    self._ui_callback(callback, False, "Account not connected", [])
+                    return
+
+                result = session.call("Notes.get", {
+                    "folderIds": [folder_id],
+                    "query": {
+                        "start": 0,
+                        "limit": 500
+                    }
+                })
+
+                notes = result.get("list", [])
+                # Extract relevant fields
+                notes_data = []
+                for note in notes:
+                    text = note.get("text", "")
+                    # Subject is first line of text
+                    lines = text.split("\n", 1)
+                    subject = lines[0] if lines else ""
+                    body = lines[1].lstrip("\n") if len(lines) > 1 else ""
+                    notes_data.append({
+                        "id": note.get("id", ""),
+                        "subject": subject,
+                        "body": body,
+                    })
+
+                self._ui_callback(callback, True, None, notes_data)
+
+            except Exception as e:
+                self._ui_callback(callback, False, str(e), [])
+
+        self.executor.submit(do_fetch)
+
+    def create_note(self, account_id: int, folder_id: str, subject: str, text: str,
+                    callback: Optional[Callable] = None):
+        """Create a new note.
+
+        Note: Kerio Notes use 'text' field, not 'body'. The subject is stored
+        as the first line of text. API-created notes may crash Kerio's web UI
+        when opened, but work fine via API.
+        """
+        def do_create():
+            try:
+                session = self.pool.get_session(account_id)
+                if not session:
+                    self._ui_callback(callback, False, "Account not connected", None)
+                    return
+
+                # Store subject as first line, then the content
+                full_text = f"{subject}\n\n{text}"
+                result = session.call("Notes.create", {
+                    "notes": [{
+                        "folderId": folder_id,
+                        "text": full_text
+                    }]
+                })
+
+                # Get created note ID
+                created = result.get("result", [])
+                if created and len(created) > 0:
+                    note_id = created[0].get("id", "")
+                    self._ui_callback(callback, True, None, note_id)
+                else:
+                    self._ui_callback(callback, True, None, None)
+
+            except Exception as e:
+                self._ui_callback(callback, False, str(e), None)
+
+        self.executor.submit(do_create)
+
+    def update_note(self, account_id: int, note_id: str, subject: str, text: str,
+                    callback: Optional[Callable] = None):
+        """Update an existing note."""
+        def do_update():
+            try:
+                session = self.pool.get_session(account_id)
+                if not session:
+                    self._ui_callback(callback, False, "Account not connected")
+                    return
+
+                # Store subject as first line, then the content
+                full_text = f"{subject}\n\n{text}"
+                session.call("Notes.set", {
+                    "notes": [{
+                        "id": note_id,
+                        "text": full_text
+                    }]
+                })
+
+                self._ui_callback(callback, True, None)
+
+            except Exception as e:
+                self._ui_callback(callback, False, str(e))
+
+        self.executor.submit(do_update)
+
+    def delete_note(self, account_id: int, note_id: str,
+                    callback: Optional[Callable] = None):
+        """Delete a note."""
+        def do_delete():
+            try:
+                session = self.pool.get_session(account_id)
+                if not session:
+                    self._ui_callback(callback, False, "Account not connected")
+                    return
+
+                session.call("Notes.remove", {"ids": [note_id]})
+                self._ui_callback(callback, True, None)
+
+            except Exception as e:
+                self._ui_callback(callback, False, str(e))
+
+        self.executor.submit(do_delete)
+
+    def find_note_by_subject(self, account_id: int, folder_id: str, subject: str,
+                              callback: Optional[Callable] = None):
+        """Find a note by its subject (exact match)."""
+        def do_find():
+            try:
+                session = self.pool.get_session(account_id)
+                if not session:
+                    self._ui_callback(callback, False, "Account not connected", None)
+                    return
+
+                result = session.call("Notes.get", {
+                    "folderIds": [folder_id],
+                    "query": {
+                        "start": 0,
+                        "limit": 500
+                    }
+                })
+
+                notes = result.get("list", [])
+                for note in notes:
+                    text = note.get("text", "")
+                    # Subject is first line of text
+                    lines = text.split("\n", 1)
+                    note_subject = lines[0] if lines else ""
+                    body = lines[1].lstrip("\n") if len(lines) > 1 else ""
+
+                    if note_subject == subject:
+                        self._ui_callback(callback, True, None, {
+                            "id": note.get("id", ""),
+                            "subject": note_subject,
+                            "body": body
+                        })
+                        return
+
+                # Not found
+                self._ui_callback(callback, True, None, None)
+
+            except Exception as e:
+                self._ui_callback(callback, False, str(e), None)
+
+        self.executor.submit(do_find)
