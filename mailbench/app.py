@@ -779,6 +779,7 @@ class MessageWindow(QMainWindow):
         self.full_data = full_data or {}
         self.account_id = account_id
         self._dark_mode = dark_mode
+        self._compose_widget = None
 
         subject = msg_data.get('subject', '(No Subject)')
         self.setWindowTitle(subject)
@@ -827,9 +828,13 @@ class MessageWindow(QMainWindow):
         delete_action.triggered.connect(self._delete)
         toolbar.addAction(delete_action)
 
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
+        # Use stacked widget to switch between message view and compose
+        self._stack = QStackedWidget()
+        self.setCentralWidget(self._stack)
+
+        # Message view widget (index 0)
+        self._message_widget = QWidget()
+        layout = QVBoxLayout(self._message_widget)
         layout.setContentsMargins(10, 10, 10, 10)
 
         # Header - fixed size, doesn't stretch
@@ -902,7 +907,7 @@ class MessageWindow(QMainWindow):
                 # Block remote images to prevent tracking
                 body = block_remote_images(body)
                 # Inject sans-serif font style
-                font_style = "<style>body { font-family: sans-serif; }</style>"
+                font_style = "<style>body { font-family: sans-serif; } p { margin: 0.3em 0; } div { margin: 0; }</style>"
                 if body.lower().strip().startswith('<!doctype') or body.lower().strip().startswith('<html'):
                     for tag in ['<head>', '<HEAD>', '<html>', '<HTML>']:
                         if tag in body:
@@ -928,6 +933,58 @@ class MessageWindow(QMainWindow):
                 self.body_text.setPlainText(body)
         layout.addWidget(self.body_text, 1)  # stretch factor = 1
 
+        # Add message widget to stack
+        self._stack.addWidget(self._message_widget)
+
+    def _show_compose(self, reply_to=None, forward=None):
+        """Show compose widget in this window."""
+        from mailbench.views.compose import ComposeWidget
+
+        # Remove old compose widget if exists
+        if self._compose_widget:
+            self._stack.removeWidget(self._compose_widget)
+            self._compose_widget.deleteLater()
+            self._compose_widget = None
+
+        parent = self.parent()
+        signature = parent._signatures.get(self.account_id, "") if self.account_id else ""
+
+        self._compose_widget = ComposeWidget(
+            self, parent.db, parent.sync_manager, self.account_id,
+            reply_to=reply_to, forward=forward, signature=signature,
+            font_size=parent.font_size, zoom=parent._preview_zoom
+        )
+        self._compose_widget.message_sent.connect(self._on_compose_done)
+        self._compose_widget.compose_cancelled.connect(self._on_compose_cancelled)
+
+        if parent._address_book:
+            self._compose_widget.set_address_book(parent._address_book)
+
+        self._stack.addWidget(self._compose_widget)
+        self._stack.setCurrentWidget(self._compose_widget)
+
+        # Update window title
+        if reply_to:
+            self.setWindowTitle("Re: " + reply_to.get('subject', ''))
+        elif forward:
+            self.setWindowTitle("Fwd: " + forward.get('subject', ''))
+
+        QTimer.singleShot(0, self._compose_widget.focus_to_field)
+
+    def _on_compose_done(self):
+        """Message sent - close the window."""
+        self.close()
+
+    def _on_compose_cancelled(self):
+        """Compose cancelled - go back to message view."""
+        self._stack.setCurrentWidget(self._message_widget)
+        self.setWindowTitle(self.msg_data.get('subject', '(No Subject)'))
+
+        if self._compose_widget:
+            self._stack.removeWidget(self._compose_widget)
+            self._compose_widget.deleteLater()
+            self._compose_widget = None
+
     def _reply(self):
         """Reply to the message."""
         reply_data = {
@@ -939,8 +996,7 @@ class MessageWindow(QMainWindow):
             'body': self.full_data.get('body', ''),
             'reply_all': False
         }
-        self.parent()._show_compose(reply_to=reply_data)
-        self.close()
+        self._show_compose(reply_to=reply_data)
 
     def _reply_all(self):
         """Reply all to the message."""
@@ -954,8 +1010,7 @@ class MessageWindow(QMainWindow):
             'body': self.full_data.get('body', ''),
             'reply_all': True
         }
-        self.parent()._show_compose(reply_to=reply_data)
-        self.close()
+        self._show_compose(reply_to=reply_data)
 
     def _forward(self):
         """Forward the message."""
@@ -967,8 +1022,7 @@ class MessageWindow(QMainWindow):
             'to': self.full_data.get('to', ''),
             'body': self.full_data.get('body', '')
         }
-        self.parent()._show_compose(forward=forward_data)
-        self.close()
+        self._show_compose(forward=forward_data)
 
     def _delete(self):
         """Delete the message."""
@@ -1257,6 +1311,7 @@ class MailbenchWindow(QMainWindow):
         self._folder_tree.customContextMenuRequested.connect(self._show_folder_context_menu)
         folder_layout.addWidget(self._folder_tree)
 
+        folder_widget.setMinimumWidth(100)
         self._splitter.addWidget(folder_widget)
 
         # Right splitter (message list | preview)
@@ -1300,6 +1355,7 @@ class MailbenchWindow(QMainWindow):
         self._message_list.selectionModel().currentChanged.connect(self._on_message_selection_changed)
         message_layout.addWidget(self._message_list)
 
+        message_widget.setMinimumWidth(150)
         self._right_splitter.addWidget(message_widget)
 
         # Right pane - Stacked widget for Preview/Compose
@@ -1437,11 +1493,16 @@ class MailbenchWindow(QMainWindow):
         # Index 1: Compose widget (created on demand)
         self._compose_widget = None
 
+        self._preview_stack.setMinimumWidth(200)
         self._right_splitter.addWidget(self._preview_stack)
 
         # Set splitter sizes
         self._splitter.setSizes([200, 1000])
         self._right_splitter.setSizes([400, 600])
+
+        # Allow widgets to be resized freely
+        self._splitter.setChildrenCollapsible(False)
+        self._right_splitter.setChildrenCollapsible(False)
 
     def _create_statusbar(self):
         """Create the status bar."""
@@ -2108,7 +2169,7 @@ class MailbenchWindow(QMainWindow):
                     # Check if any images were actually blocked
                     self._images_blocked = (body != original_body)
                 # Inject sans-serif font style
-                font_style = "<style>body { font-family: sans-serif; }</style>"
+                font_style = "<style>body { font-family: sans-serif; } p { margin: 0.3em 0; } div { margin: 0; }</style>"
                 if body.lower().strip().startswith('<!doctype') or body.lower().strip().startswith('<html'):
                     # Insert style after <head> or <html> tag
                     for tag in ['<head>', '<HEAD>', '<html>', '<HTML>']:
@@ -2165,7 +2226,7 @@ class MailbenchWindow(QMainWindow):
         body = sanitize_html(self._current_body_html)
 
         if self._use_webengine:
-            font_style = "<style>body { font-family: sans-serif; }</style>"
+            font_style = "<style>body { font-family: sans-serif; } p { margin: 0.3em 0; } div { margin: 0; }</style>"
             if body.lower().strip().startswith('<!doctype') or body.lower().strip().startswith('<html'):
                 for tag in ['<head>', '<HEAD>', '<html>', '<HTML>']:
                     if tag in body:
