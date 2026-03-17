@@ -157,6 +157,145 @@ def sanitize_html(html: str) -> str:
     return html
 
 
+def detect_homograph(domain: str) -> tuple[bool, str]:
+    """Detect potential homograph attacks in a domain.
+
+    Returns (is_homograph, explanation).
+    """
+    # Common lookalike substitutions
+    lookalikes = {
+        # Cyrillic lookalikes for Latin
+        '\u0430': 'a',  # Cyrillic а
+        '\u0435': 'e',  # Cyrillic е
+        '\u043e': 'o',  # Cyrillic о
+        '\u0440': 'p',  # Cyrillic р
+        '\u0441': 'c',  # Cyrillic с
+        '\u0445': 'x',  # Cyrillic х
+        '\u0443': 'y',  # Cyrillic у
+        # Greek lookalikes
+        '\u03b1': 'a',  # Greek α
+        '\u03bf': 'o',  # Greek ο
+        # Common number/letter substitutions
+        '0': 'o',
+        '1': 'l',
+        '5': 's',
+        # Common typosquatting
+        'rn': 'm',  # "rn" looks like "m"
+    }
+
+    # Check for mixed scripts (Latin + Cyrillic/Greek)
+    has_latin = bool(re.search(r'[a-zA-Z]', domain))
+    has_cyrillic = bool(re.search(r'[\u0400-\u04FF]', domain))
+    has_greek = bool(re.search(r'[\u0370-\u03FF]', domain))
+
+    if has_latin and (has_cyrillic or has_greek):
+        return (True, "Domain mixes Latin with Cyrillic/Greek characters (possible homograph attack)")
+
+    # Check for lookalike characters
+    domain_lower = domain.lower()
+    for char, looks_like in lookalikes.items():
+        if char in domain_lower:
+            return (True, f"Domain contains characters that look like '{looks_like}'")
+
+    # Check for "rn" -> "m" substitution in common words
+    common_targets = ['paypal', 'amazon', 'google', 'microsoft', 'apple', 'bank', 'secure', 'login']
+    for target in common_targets:
+        # Check if domain contains something like "arnazon" (rn instead of m)
+        rn_variant = target.replace('m', 'rn')
+        if rn_variant in domain_lower and target not in domain_lower:
+            return (True, f"Domain may be impersonating '{target}'")
+
+    return (False, "")
+
+
+def analyze_url_safety(url_str: str) -> tuple[bool, str, list[str]]:
+    """Analyze a URL for potential security risks.
+
+    Returns (is_suspicious, domain, warnings_list).
+    """
+    from urllib.parse import urlparse
+
+    warnings = []
+
+    try:
+        parsed = urlparse(url_str)
+        domain = parsed.netloc or parsed.path.split('/')[0]
+
+        # Remove port if present for display
+        display_domain = domain.split(':')[0] if ':' in domain else domain
+
+        # Check for IP address instead of domain name
+        ip_pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
+        if re.match(ip_pattern, display_domain):
+            warnings.append("This link uses an IP address instead of a domain name")
+
+        # Check for punycode/IDN (internationalized domain)
+        if 'xn--' in domain.lower():
+            warnings.append("This link uses an internationalized domain name (IDN)")
+
+        # Check for homograph attacks
+        is_homograph, homograph_warning = detect_homograph(display_domain)
+        if is_homograph:
+            warnings.append(homograph_warning)
+
+        # Common URL shorteners (potential for hiding malicious URLs)
+        shorteners = {'bit.ly', 'tinyurl.com', 't.co', 'goo.gl', 'ow.ly', 'is.gd',
+                      'buff.ly', 'adf.ly', 'j.mp', 'tr.im', 'v.gd', 'shorturl.at'}
+        if display_domain.lower() in shorteners:
+            warnings.append("This is a URL shortener - the final destination is hidden")
+
+        # Check for suspicious patterns in domain
+        # Double extensions like .com.evil.com
+        parts = display_domain.lower().split('.')
+        trusted_tlds = {'com', 'org', 'net', 'edu', 'gov', 'io', 'co'}
+        for i, part in enumerate(parts[:-1]):  # Skip the actual TLD
+            if part in trusted_tlds:
+                warnings.append(f"Domain contains '{part}' but it's not the actual domain")
+                break
+
+        # HTTP instead of HTTPS
+        if parsed.scheme == 'http':
+            warnings.append("This link uses unencrypted HTTP (not HTTPS)")
+
+        is_suspicious = len(warnings) > 0
+        return (is_suspicious, display_domain, warnings)
+
+    except Exception:
+        return (True, url_str, ["Could not parse URL"])
+
+
+def show_link_warning(url_str: str, parent=None) -> bool:
+    """Show a warning dialog for external links.
+
+    Returns True if user wants to proceed, False otherwise.
+    """
+    is_suspicious, domain, warnings = analyze_url_safety(url_str)
+
+    if is_suspicious:
+        # Show warning dialog
+        msg = QMessageBox(parent)
+        msg.setWindowTitle("Security Warning")
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setText(f"You are about to open a link to:\n\n{domain}")
+
+        warning_text = "\n".join(f"• {w}" for w in warnings)
+        msg.setInformativeText(f"Warnings:\n{warning_text}\n\nDo you want to continue?")
+        msg.setDetailedText(f"Full URL:\n{url_str}")
+        msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        msg.setDefaultButton(QMessageBox.StandardButton.No)
+        return msg.exec() == QMessageBox.StandardButton.Yes
+    else:
+        # Show confirmation for normal links
+        msg = QMessageBox(parent)
+        msg.setWindowTitle("Open Link")
+        msg.setIcon(QMessageBox.Icon.Question)
+        msg.setText(f"Open link to:\n\n{domain}")
+        msg.setDetailedText(f"Full URL:\n{url_str}")
+        msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        msg.setDefaultButton(QMessageBox.StandardButton.Yes)
+        return msg.exec() == QMessageBox.StandardButton.Yes
+
+
 # Custom WebEngine page to intercept link clicks
 if HAS_WEBENGINE:
     from PySide6.QtWebEngineCore import QWebEnginePage
@@ -171,8 +310,9 @@ if HAS_WEBENGINE:
         def acceptNavigationRequest(self, url, nav_type, is_main_frame):
             url_str = url.toString()
             if url_str.startswith('http://') or url_str.startswith('https://'):
-                from PySide6.QtGui import QDesktopServices
-                QDesktopServices.openUrl(url)
+                if show_link_warning(url_str):
+                    from PySide6.QtGui import QDesktopServices
+                    QDesktopServices.openUrl(url)
             # Always reject - this page is just for capturing the URL
             self.deleteLater()
             return False
@@ -199,10 +339,11 @@ if HAS_WEBENGINE:
             if not url_str or url_str.startswith('javascript:'):
                 return False
 
-            # External URL (http/https) - open in default browser
+            # External URL (http/https) - show warning and open in default browser
             if url_str.startswith('http://') or url_str.startswith('https://'):
-                from PySide6.QtGui import QDesktopServices
-                QDesktopServices.openUrl(url)
+                if show_link_warning(url_str):
+                    from PySide6.QtGui import QDesktopServices
+                    QDesktopServices.openUrl(url)
                 return False  # Don't navigate in the email viewer
 
             # Block other URL schemes
@@ -1823,7 +1964,11 @@ class MailbenchWindow(QMainWindow):
         preview_layout.addWidget(self._preview_body, 1)  # stretch factor = 1
 
         # Install event filter for Ctrl+scroll zoom
+        # For WebEngineView, we need to filter on the focusProxy (render widget)
         self._preview_body.installEventFilter(self)
+        if HAS_WEBENGINE and isinstance(self._preview_body, QWebEngineView):
+            # WebEngineView's child widget receives the actual wheel events
+            QTimer.singleShot(100, self._install_webengine_event_filter)
 
         self._preview_stack.addWidget(self._preview_widget)  # Index 0
 
@@ -1846,6 +1991,11 @@ class MailbenchWindow(QMainWindow):
         self._statusbar = QStatusBar()
         self.setStatusBar(self._statusbar)
         self._statusbar.showMessage("Ready")
+
+        # Permanent zoom indicator on the right side
+        self._zoom_label = QLabel(f"Zoom: {self._preview_zoom}%")
+        self._zoom_label.setStyleSheet("padding: 0 10px; color: black;")
+        self._statusbar.addPermanentWidget(self._zoom_label)
 
     def _apply_theme(self):
         """Apply theme - force light mode."""
@@ -1902,6 +2052,14 @@ class MailbenchWindow(QMainWindow):
                 return True  # Event handled
         return super().eventFilter(obj, event)
 
+    def _install_webengine_event_filter(self):
+        """Install event filter on WebEngineView's child widget for wheel events."""
+        if HAS_WEBENGINE and isinstance(self._preview_body, QWebEngineView):
+            # The focusProxy is the widget that actually receives input events
+            child = self._preview_body.focusProxy()
+            if child:
+                child.installEventFilter(self)
+
     def _preview_zoom_in(self):
         """Increase preview zoom level."""
         if self._preview_zoom < 200:
@@ -1937,8 +2095,9 @@ class MailbenchWindow(QMainWindow):
         if self._compose_widget is not None:
             self._compose_widget.set_zoom(zoom_factor)
 
-        # Update status bar
-        self._statusbar.showMessage(f"Zoom: {self._preview_zoom}%", 2000)
+        # Update permanent zoom indicator
+        if hasattr(self, '_zoom_label'):
+            self._zoom_label.setText(f"Zoom: {self._preview_zoom}%")
 
     def _detect_dark_mode(self) -> bool:
         """Detect if dark mode should be used based on theme setting."""

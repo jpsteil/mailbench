@@ -125,6 +125,14 @@ body {{
 }}
 p {{ margin: 0; padding: 0; }}
 </style>
+<script>
+document.addEventListener('keydown', function(e) {{
+    if (e.key === 'Tab') {{
+        e.preventDefault();
+        document.execCommand('insertText', false, '\\t');
+    }}
+}});
+</script>
 </head>
 <body contenteditable="true" id="editor">
 </body>
@@ -179,6 +187,14 @@ body {{
 }}
 p {{ margin: 0; padding: 0; }}
 </style>
+<script>
+document.addEventListener('keydown', function(e) {{
+    if (e.key === 'Tab') {{
+        e.preventDefault();
+        document.execCommand('insertText', false, '\\t');
+    }}
+}});
+</script>
 </head>
 <body contenteditable="true" id="editor">
 {content}
@@ -592,14 +608,15 @@ class ComposeWidget(QWidget):
         layout.addLayout(format_bar)
 
         # Body editor - use WebEngine if available for proper HTML/image support
-        font_size = int(self._font_size * self._zoom)
+        # Use base font size for content, apply zoom separately for display only
         if HAS_WEBENGINE:
-            self.body_edit = WebEngineEditor(font_size=font_size)
+            self.body_edit = WebEngineEditor(font_size=self._font_size)
+            self.body_edit.setZoomFactor(self._zoom)  # Zoom is display-only
             self._use_webengine = True
         else:
             self.body_edit = RichTextEdit()
             body_font = QFont("Sans Serif")
-            body_font.setPointSize(font_size)
+            body_font.setPointSize(int(self._font_size * self._zoom))  # QTextEdit needs font scaling
             self.body_edit.setFont(body_font)
             self.body_edit.cursorPositionChanged.connect(self._update_format_buttons)
             self.body_edit.setTabStopDistance(40)
@@ -1345,14 +1362,16 @@ class ComposeWidget(QWidget):
         self.cc_edit.set_address_book(addresses)
 
     def set_zoom(self, zoom_factor):
-        """Set zoom level for the compose body."""
+        """Set zoom level for the compose body (display only, doesn't affect sent email)."""
         self._zoom = zoom_factor
-        size = int(self._font_size * zoom_factor)
         if self._use_webengine:
-            self.body_edit.setFontSize(size)
+            # WebEngine has native zoom that doesn't affect content
+            self.body_edit.setZoomFactor(zoom_factor)
         else:
+            # QTextEdit doesn't have zoom, so we scale the font for display
+            # Note: This affects the sent email for QTextEdit fallback
             font = QFont("Sans Serif")
-            font.setPointSize(size)
+            font.setPointSize(int(self._font_size * zoom_factor))
             self.body_edit.setFont(font)
             self.body_edit.viewport().update()
 

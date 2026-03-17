@@ -4,7 +4,7 @@ import threading
 import urllib.request
 import json
 
-__version__ = "0.5.4"
+__version__ = "0.5.5"
 
 
 def get_installed_version():
