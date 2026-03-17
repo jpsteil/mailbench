@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QToolBar, QStatusBar, QMenu, QMenuBar, QMessageBox, QFrame,
     QStyledItemDelegate, QStyle, QAbstractItemView, QSizePolicy,
     QPushButton, QDialog, QFileDialog, QGridLayout, QStackedWidget,
-    QToolButton
+    QToolButton, QProgressDialog
 )
 try:
     from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -161,52 +161,52 @@ def sanitize_html(html: str) -> str:
 if HAS_WEBENGINE:
     from PySide6.QtWebEngineCore import QWebEnginePage
 
+    class ExternalLinkPage(QWebEnginePage):
+        """Dummy page that captures URL and opens in external browser."""
+
+        def __init__(self, parent_page):
+            super().__init__(parent_page)
+            self._parent_page = parent_page
+
+        def acceptNavigationRequest(self, url, nav_type, is_main_frame):
+            url_str = url.toString()
+            if url_str.startswith('http://') or url_str.startswith('https://'):
+                from PySide6.QtGui import QDesktopServices
+                QDesktopServices.openUrl(url)
+            # Always reject - this page is just for capturing the URL
+            self.deleteLater()
+            return False
+
     class SafeLinkPage(QWebEnginePage):
         """WebEngine page that intercepts link clicks for safety checks."""
 
+        def __init__(self, parent=None):
+            super().__init__(parent)
+
+        def createWindow(self, window_type):
+            """Handle target="_blank" links by creating a dummy page to capture URL."""
+            # Return a dummy page that will capture the URL and open externally
+            return ExternalLinkPage(self)
+
         def acceptNavigationRequest(self, url, nav_type, is_main_frame):
-            # Only intercept link clicks, not initial page loads
-            if nav_type == QWebEnginePage.NavigationType.NavigationTypeLinkClicked:
-                url_str = url.toString()
+            url_str = url.toString()
 
-                # Skip empty or javascript URLs
-                if not url_str or url_str.startswith('javascript:'):
-                    return False
+            # Allow internal navigation (data: URLs for setHtml, about:blank)
+            if url_str.startswith('data:') or url_str == 'about:blank':
+                return True
 
-                # Build warning message
-                warnings = []
+            # Skip empty or javascript URLs
+            if not url_str or url_str.startswith('javascript:'):
+                return False
 
-                # Check for HTTP (not HTTPS)
-                if url_str.startswith('http://'):
-                    warnings.append("• This link uses HTTP (not secure)")
-
-                # Show confirmation dialog
-                from PySide6.QtWidgets import QMessageBox
-                msg = QMessageBox()
-                msg.setWindowTitle("Open Link")
-                msg.setIcon(QMessageBox.Icon.Question)
-
-                safety_tip = "Before opening, verify this goes where you expect. Attackers often disguise malicious links."
-
-                if warnings:
-                    msg.setText("This link has security concerns:")
-                    msg.setInformativeText("\n".join(warnings) + f"\n\n{safety_tip}\n\nURL: {url_str}")
-                else:
-                    msg.setText("Open this link in your browser?")
-                    msg.setInformativeText(f"{safety_tip}\n\nURL: {url_str}")
-
-                msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                msg.setDefaultButton(QMessageBox.StandardButton.No if warnings else QMessageBox.StandardButton.Yes)
-
-                if msg.exec() == QMessageBox.StandardButton.Yes:
-                    # Open in external browser
-                    from PySide6.QtGui import QDesktopServices
-                    QDesktopServices.openUrl(url)
-
+            # External URL (http/https) - open in default browser
+            if url_str.startswith('http://') or url_str.startswith('https://'):
+                from PySide6.QtGui import QDesktopServices
+                QDesktopServices.openUrl(url)
                 return False  # Don't navigate in the email viewer
 
-            # Allow other navigation (initial load, etc.)
-            return super().acceptNavigationRequest(url, nav_type, is_main_frame)
+            # Block other URL schemes
+            return False
 
 
 # Icons (Unicode)
@@ -223,6 +223,9 @@ class MessageData:
         self.item_id = data.get('item_id', '')
         self.sender_name = data.get('sender_name', '')
         self.sender_email = data.get('sender_email', '')
+        self.to_name = data.get('to_name', '')
+        self.to_email = data.get('to_email', '')
+        self.to_count = data.get('to_count', 0)
         self.subject = data.get('subject', '') or '(No Subject)'
         self.date_received = data.get('date_received', '')
         self.size = data.get('size', 0)
@@ -236,6 +239,14 @@ class MessageData:
     @property
     def sender_display(self) -> str:
         return self.sender_name or self.sender_email or 'Unknown'
+
+    @property
+    def recipient_display(self) -> str:
+        """Display string for recipients (used in Sent/Drafts folders)."""
+        name = self.to_name or self.to_email or 'Unknown'
+        if self.to_count > 1:
+            return f"{name} (+{self.to_count - 1})"
+        return name
 
     @property
     def date_display(self) -> str:
@@ -364,7 +375,9 @@ class MessageListModel(QAbstractListModel):
                 msg for msg in self._messages
                 if (self._filter_text in msg.sender_display.lower() or
                     self._filter_text in msg.subject.lower() or
-                    self._filter_text in msg.sender_email.lower())
+                    self._filter_text in msg.sender_email.lower() or
+                    self._filter_text in msg.recipient_display.lower() or
+                    self._filter_text in msg.to_email.lower())
             ]
         self.endResetModel()
 
@@ -512,7 +525,12 @@ class MessageDelegate(QStyledItemDelegate):
         self.dark_mode = dark_mode
         self.font_size = font_size
         self._row_height = max(48, int(font_size * 4))  # Scale row height with font
+        self._show_recipients = False  # True for Sent/Drafts folders
         self._setup_colors()
+
+    def set_show_recipients(self, show: bool):
+        """Set whether to show recipients instead of sender (for Sent/Drafts)."""
+        self._show_recipients = show
 
     def _setup_colors(self):
         """Setup colors based on theme."""
@@ -644,10 +662,10 @@ class MessageDelegate(QStyledItemDelegate):
             painter.restore()
             return
 
-        # Sender
+        # Sender (or Recipient for Sent/Drafts folders)
         painter.setFont(sender_font)
         painter.setPen(QPen(sender_color))
-        sender_text = msg.sender_display
+        sender_text = msg.recipient_display if self._show_recipients else msg.sender_display
         fm = QFontMetrics(sender_font)
         sender_text = fm.elidedText(sender_text, Qt.TextElideMode.ElideRight, clip_w)
         painter.drawText(left_x, y + 6, clip_w, 20,
@@ -1162,6 +1180,7 @@ class MessageWindow(QMainWindow):
         else:
             self.body_text = QTextEdit()
             self.body_text.setReadOnly(True)
+            self.body_text.setOpenExternalLinks(True)
             self.body_text.setFont(QFont("Sans Serif", 12))
             if body_type == 'html':
                 # Sanitize HTML to prevent XSS attacks
@@ -1235,6 +1254,7 @@ class MessageWindow(QMainWindow):
             'date': self.msg_data.get('date_received', ''),
             'to': self.full_data.get('to', ''),
             'body': self.full_data.get('body', ''),
+            'body_type': self.full_data.get('body_type', 'text'),
             'reply_all': False
         }
         self._show_compose(reply_to=reply_data)
@@ -1249,6 +1269,7 @@ class MessageWindow(QMainWindow):
             'to': self.full_data.get('to', ''),
             'cc': self.full_data.get('cc', ''),
             'body': self.full_data.get('body', ''),
+            'body_type': self.full_data.get('body_type', 'text'),
             'reply_all': True
         }
         self._show_compose(reply_to=reply_data)
@@ -1261,7 +1282,8 @@ class MessageWindow(QMainWindow):
             'subject': self.msg_data.get('subject', ''),
             'date': self.msg_data.get('date_received', ''),
             'to': self.full_data.get('to', ''),
-            'body': self.full_data.get('body', '')
+            'body': self.full_data.get('body', ''),
+            'body_type': self.full_data.get('body_type', 'text')
         }
         self._show_compose(forward=forward_data)
 
@@ -1777,6 +1799,7 @@ class MailbenchWindow(QMainWindow):
         self._read_timer.timeout.connect(self._mark_current_as_read)
         self._pending_read_item_id: Optional[str] = None
         self._skip_auto_mark_read: bool = False  # Set when user manually marks unread
+        self._suppress_auto_read: bool = False  # Suppress during background sync
 
         # Preview body - use WebEngine if available for proper HTML/image support
         if HAS_WEBENGINE:
@@ -1791,6 +1814,7 @@ class MailbenchWindow(QMainWindow):
         else:
             self._preview_body = QTextEdit()
             self._preview_body.setReadOnly(True)
+            self._preview_body.setOpenExternalLinks(True)
             self._preview_body.setFont(QFont("Sans Serif", 12))
             self._use_webengine = False
 
@@ -2050,38 +2074,43 @@ class MailbenchWindow(QMainWindow):
                 if not success or not messages_data:
                     return
 
-                # Filter blocked senders
-                filtered_messages, _ = self._filter_blocked_messages(
-                    messages_data, account_id
-                )
+                # Suppress auto-read during background sync
+                self._suppress_auto_read = True
+                try:
+                    # Filter blocked senders
+                    filtered_messages, _ = self._filter_blocked_messages(
+                        messages_data, account_id
+                    )
 
-                # Update cache
-                new_ids = {m.get('item_id') for m in filtered_messages if m.get('item_id')}
-                old_ids = set(self._messages_by_id.keys())
-                for item_id in old_ids - new_ids:
-                    if item_id in self._messages_by_id:
-                        del self._messages_by_id[item_id]
-                for msg in filtered_messages:
-                    item_id = msg.get('item_id')
-                    if item_id:
-                        self._messages_by_id[item_id] = msg
+                    # Update cache
+                    new_ids = {m.get('item_id') for m in filtered_messages if m.get('item_id')}
+                    old_ids = set(self._messages_by_id.keys())
+                    for item_id in old_ids - new_ids:
+                        if item_id in self._messages_by_id:
+                            del self._messages_by_id[item_id]
+                    for msg in filtered_messages:
+                        item_id = msg.get('item_id')
+                        if item_id:
+                            self._messages_by_id[item_id] = msg
 
-                # Incremental sync
-                added, removed = self._message_model.sync_incrementally(filtered_messages)
+                    # Incremental sync
+                    added, removed = self._message_model.sync_incrementally(filtered_messages)
 
-                # Restore selection
-                if (added or removed) and current_selection and current_selection in self._messages_by_id:
-                    for row in range(self._message_model.rowCount()):
-                        idx = self._message_model.index(row, 0)
-                        msg = self._message_model.data(idx, Qt.ItemDataRole.DisplayRole)
-                        if msg and msg.item_id == current_selection:
-                            self._message_list.setCurrentIndex(idx)
-                            break
+                    # Restore selection
+                    if (added or removed) and current_selection and current_selection in self._messages_by_id:
+                        for row in range(self._message_model.rowCount()):
+                            idx = self._message_model.index(row, 0)
+                            msg = self._message_model.data(idx, Qt.ItemDataRole.DisplayRole)
+                            if msg and msg.item_id == current_selection:
+                                self._message_list.setCurrentIndex(idx)
+                                break
 
-                if added > 0:
-                    self._statusbar.showMessage(f"{added} new message(s)")
-                else:
-                    self._statusbar.showMessage(f"{len(filtered_messages)} messages")
+                    if added > 0:
+                        self._statusbar.showMessage(f"{added} new message(s)")
+                    else:
+                        self._statusbar.showMessage(f"{len(filtered_messages)} messages")
+                finally:
+                    self._suppress_auto_read = False
 
             self.sync_manager.sync_messages(account_id, self._current_folder_id, callback=on_synced)
 
@@ -2206,8 +2235,9 @@ class MailbenchWindow(QMainWindow):
                     else:
                         self._folder_tree.collapse(folders_idx)
 
-                # Select inbox
-                self._select_inbox(account_id)
+                # Select inbox only on initial connection (no folder selected yet)
+                if not self._current_folder_id:
+                    self._select_inbox(account_id)
             else:
                 self._statusbar.showMessage(f"Failed to load folders: {error}")
 
@@ -2285,6 +2315,11 @@ class MailbenchWindow(QMainWindow):
         self._messages_by_id.clear()
         self._filter_entry.clear()
 
+        # Check folder type to determine if we show recipients (Sent/Drafts)
+        folder_type = self.db.get_folder_type(account_id, folder_id)
+        show_recipients = folder_type in ('sent', 'drafts', 'outbox')
+        self._message_delegate.set_show_recipients(show_recipients)
+
         # Clear preview pane and current message state
         self._preview_from.setText("")
         self._preview_to.setText("")
@@ -2359,6 +2394,8 @@ class MailbenchWindow(QMainWindow):
 
     def _on_message_selection_changed(self, current: QModelIndex, previous: QModelIndex):
         """Handle message selection change (keyboard navigation)."""
+        if self._suppress_auto_read:
+            return  # Don't process selection changes during background sync
         if current.isValid():
             self._on_message_clicked(current)
 
@@ -3162,9 +3199,16 @@ class MailbenchWindow(QMainWindow):
         if result != QMessageBox.StandardButton.Yes:
             return
 
-        self._statusbar.showMessage("Emptying trash...")
+        # Show indeterminate progress dialog
+        progress = QProgressDialog("Emptying trash...", None, 0, 0, self)
+        progress.setWindowTitle("Empty Trash")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setCancelButton(None)  # Can't cancel server-side operation
+        progress.show()
 
         def on_empty_complete(success: bool, error: str, count: int):
+            progress.close()
             if success:
                 self._statusbar.showMessage(f"Deleted {count} messages from trash")
                 # Refresh the folder if we're viewing it
@@ -3172,6 +3216,7 @@ class MailbenchWindow(QMainWindow):
                     self._message_model.clear()
                     self._current_message_id = None
                     self._clear_preview()
+                self._message_list.setFocus()
             else:
                 self._statusbar.showMessage(f"Failed to empty trash: {error}")
                 QMessageBox.warning(self, "Error", f"Failed to empty trash: {error}")
@@ -3339,6 +3384,7 @@ class MailbenchWindow(QMainWindow):
             'date': msg_data.get('date_received', ''),
             'to': full_data.get('to', ''),
             'body': full_data.get('body', ''),
+            'body_type': full_data.get('body_type', 'text'),
             'reply_all': False
         }
 
@@ -3360,6 +3406,7 @@ class MailbenchWindow(QMainWindow):
             'to': full_data.get('to', ''),
             'cc': full_data.get('cc', ''),
             'body': full_data.get('body', ''),
+            'body_type': full_data.get('body_type', 'text'),
             'reply_all': True
         }
 
@@ -3379,7 +3426,8 @@ class MailbenchWindow(QMainWindow):
             'subject': msg_data.get('subject', ''),
             'date': msg_data.get('date_received', ''),
             'to': full_data.get('to', ''),
-            'body': full_data.get('body', '')
+            'body': full_data.get('body', ''),
+            'body_type': full_data.get('body_type', 'text')
         }
 
         self._show_compose(forward=forward_data)
@@ -3390,24 +3438,86 @@ class MailbenchWindow(QMainWindow):
         if not selection:
             return
 
-        if len(selection) > 1:
+        count = len(selection)
+        if count > 1:
             if QMessageBox.question(
                 self, "Delete Messages",
-                f"Delete {len(selection)} selected messages?"
+                f"Delete {count} selected messages?"
             ) != QMessageBox.StandardButton.Yes:
                 return
 
-        # Remember the row to select after deletion (for single delete)
-        next_row = selection[0].row() if len(selection) == 1 else -1
+        # Remember the row to select after deletion
+        next_row = selection[0].row() if count == 1 else 0
 
+        # Collect message IDs to delete
+        messages_to_delete = []
         for index in selection:
             msg: MessageData = index.data(Qt.ItemDataRole.DisplayRole)
             if msg and self._current_account_id:
-                self.sync_manager.delete_message(
-                    self._current_account_id,
-                    msg.item_id,
-                    callback=lambda s, e, iid=msg.item_id, row=next_row: self._on_message_deleted(s, e, iid, row)
-                )
+                messages_to_delete.append(msg.item_id)
+
+        if not messages_to_delete:
+            return
+
+        # Show progress dialog for multiple messages
+        if count > 1:
+            progress = QProgressDialog("Deleting messages...", "Cancel", 0, count, self)
+            progress.setWindowTitle("Delete")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
+        else:
+            progress = None
+
+        deleted_count = [0]  # Use list to allow modification in nested function
+        cancelled = [False]
+
+        def on_deleted(success, error, item_id):
+            if cancelled[0]:
+                return
+
+            if progress and progress.wasCanceled():
+                cancelled[0] = True
+                if progress:
+                    progress.close()
+                self._message_list.setFocus()
+                return
+
+            deleted_count[0] += 1
+
+            if success:
+                self._message_model.remove_message(item_id)
+                if item_id in self._messages_by_id:
+                    del self._messages_by_id[item_id]
+
+            if progress:
+                progress.setValue(deleted_count[0])
+
+            # All done?
+            if deleted_count[0] >= count:
+                if progress:
+                    progress.close()
+
+                # Select next message
+                row_count = self._message_model.rowCount()
+                if row_count > 0:
+                    new_row = min(max(0, next_row), row_count - 1)
+                    new_index = self._message_model.index(new_row)
+                    self._message_list.setCurrentIndex(new_index)
+                    self._on_message_clicked(new_index)
+                else:
+                    self._current_message_id = None
+                    self._clear_preview()
+
+                self._message_list.setFocus()
+
+        # Start deletions
+        for item_id in messages_to_delete:
+            self.sync_manager.delete_message(
+                self._current_account_id,
+                item_id,
+                callback=lambda s, e, iid=item_id: on_deleted(s, e, iid)
+            )
 
     def _on_message_deleted(self, success: bool, error: str, item_id: str, select_row: int = -1):
         """Handle message deletion."""
@@ -3470,35 +3580,40 @@ class MailbenchWindow(QMainWindow):
             if not success or not messages_data:
                 return
 
-            # Update the messages_by_id cache
-            new_ids = {m.get('item_id') for m in messages_data if m.get('item_id')}
-            old_ids = set(self._messages_by_id.keys())
+            # Suppress auto-read during background sync
+            self._suppress_auto_read = True
+            try:
+                # Update the messages_by_id cache
+                new_ids = {m.get('item_id') for m in messages_data if m.get('item_id')}
+                old_ids = set(self._messages_by_id.keys())
 
-            # Remove deleted from cache
-            for item_id in old_ids - new_ids:
-                del self._messages_by_id[item_id]
+                # Remove deleted from cache
+                for item_id in old_ids - new_ids:
+                    del self._messages_by_id[item_id]
 
-            # Add/update in cache
-            for msg in messages_data:
-                item_id = msg.get('item_id')
-                if item_id:
-                    self._messages_by_id[item_id] = msg
+                # Add/update in cache
+                for msg in messages_data:
+                    item_id = msg.get('item_id')
+                    if item_id:
+                        self._messages_by_id[item_id] = msg
 
-            # Incremental sync - no flashing
-            added, removed = self._message_model.sync_incrementally(messages_data)
+                # Incremental sync - no flashing
+                added, removed = self._message_model.sync_incrementally(messages_data)
 
-            # Restore selection if needed
-            if (added or removed) and current_selection and current_selection in self._messages_by_id:
-                for row in range(self._message_model.rowCount()):
-                    idx = self._message_model.index(row, 0)
-                    msg = self._message_model.data(idx, Qt.ItemDataRole.DisplayRole)
-                    if msg and msg.item_id == current_selection:
-                        self._message_list.setCurrentIndex(idx)
-                        break
+                # Restore selection if needed
+                if (added or removed) and current_selection and current_selection in self._messages_by_id:
+                    for row in range(self._message_model.rowCount()):
+                        idx = self._message_model.index(row, 0)
+                        msg = self._message_model.data(idx, Qt.ItemDataRole.DisplayRole)
+                        if msg and msg.item_id == current_selection:
+                            self._message_list.setCurrentIndex(idx)
+                            break
 
-            # Update status
-            if added > 0:
-                self._statusbar.showMessage(f"{added} new message(s)")
+                # Update status
+                if added > 0:
+                    self._statusbar.showMessage(f"{added} new message(s)")
+            finally:
+                self._suppress_auto_read = False
 
         self.sync_manager.sync_messages(
             self._current_account_id,
@@ -3736,12 +3851,22 @@ class MailbenchWindow(QMainWindow):
 
         type_label = "domain" if is_domain else "email"
 
+        # Show progress dialog
+        progress = QProgressDialog(f"Blocking {type_label}: {value}...", None, 0, 0, self)
+        progress.setWindowTitle("Blocking Sender")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+
         def on_blocked(success, error):
             if success:
                 self._statusbar.showMessage(f"Blocked {type_label}: {value}", 3000)
-                # Optionally scan current folder for matches
-                self._scan_folder_for_blocked()
+                # Scan current folder for matches (pass progress dialog)
+                self._scan_folder_for_blocked(progress, value, is_domain)
             else:
+                progress.close()
                 self._statusbar.showMessage(f"Failed to block {type_label}: {error}", 5000)
 
         if is_domain:
@@ -3749,11 +3874,15 @@ class MailbenchWindow(QMainWindow):
         else:
             self.blocklist_manager.add_email(value, on_blocked)
 
-    def _scan_folder_for_blocked(self):
+    def _scan_folder_for_blocked(self, progress=None, blocked_value=None, is_domain=False):
         """Scan current folder and move blocked messages to Junk."""
         if not self._current_account_id or not self._current_folder_id:
+            if progress:
+                progress.close()
             return
         if not self._junk_folder_id:
+            if progress:
+                progress.close()
             return
 
         # Check each message in current view
@@ -3765,7 +3894,22 @@ class MailbenchWindow(QMainWindow):
                 messages_to_move.append((item_id, sender_email, match_type))
 
         if not messages_to_move:
+            if progress:
+                progress.close()
             return
+
+        # Update progress dialog for moving messages
+        if progress:
+            type_label = "domain" if is_domain else "email"
+            progress.setLabelText(f"Moving {len(messages_to_move)} message(s) from {blocked_value} to Junk...")
+            progress.setMaximum(len(messages_to_move))
+            progress.setValue(0)
+            QApplication.processEvents()
+
+        # Track completion
+        self._block_move_completed = 0
+        self._block_move_total = len(messages_to_move)
+        self._block_move_progress = progress
 
         # Move messages to Junk folder
         for item_id, sender_email, match_type in messages_to_move:
@@ -3777,16 +3921,26 @@ class MailbenchWindow(QMainWindow):
                     else:
                         self.blocklist_manager.increment_blocked(email, False)
 
+                # Update progress
+                self._block_move_completed += 1
+                if self._block_move_progress:
+                    self._block_move_progress.setValue(self._block_move_completed)
+                    QApplication.processEvents()
+
+                # Check if all done
+                if self._block_move_completed >= self._block_move_total:
+                    if self._block_move_progress:
+                        self._block_move_progress.close()
+                        self._block_move_progress = None
+                    # Refresh folder view
+                    self._on_folder_selected(self._current_account_id, self._current_folder_id)
+
             self.sync_manager.move_message(
                 self._current_account_id, item_id,
                 self._junk_folder_id, on_moved
             )
 
-        # Refresh folder view
         self._statusbar.showMessage(f"Moving {len(messages_to_move)} blocked message(s) to Junk...", 3000)
-        QTimer.singleShot(1000, lambda: self._on_folder_selected(
-            self._current_account_id, self._current_folder_id
-        ))
 
     def _show_blocklist_dialog(self):
         """Show the blocked senders management dialog."""

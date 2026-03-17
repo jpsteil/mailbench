@@ -491,6 +491,15 @@ class Database:
             """, (account_id,))
             return [dict(row) for row in cursor.fetchall()]
 
+    def get_folder_type(self, account_id, folder_id):
+        """Get the type of a folder (inbox, sent, drafts, trash, junk, etc.)."""
+        with self._get_conn() as conn:
+            cursor = conn.execute("""
+                SELECT folder_type FROM folders WHERE account_id = ? AND folder_id = ?
+            """, (account_id, folder_id))
+            row = cursor.fetchone()
+            return row[0] if row else None
+
     def save_folder(self, account_id, folder_id, name, parent_id=None, folder_type=None,
                     unread_count=0, total_count=0, sync_state=None):
         """Save or update a folder."""

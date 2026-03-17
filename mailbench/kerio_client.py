@@ -397,7 +397,7 @@ class SyncManager:
 
                 # Query messages - only fetch fields needed for list display (47x faster!)
                 query = {
-                    "fields": ["id", "subject", "from", "receiveDate", "isSeen", "hasAttachment", "isFlagged", "isAnswered", "isForwarded"],
+                    "fields": ["id", "subject", "from", "to", "receiveDate", "isSeen", "hasAttachment", "isFlagged", "isAnswered", "isForwarded"],
                     "start": 0,
                     "limit": limit,
                     "orderBy": [{"columnName": "receiveDate", "direction": "Desc", "caseSensitive": False}]
@@ -422,6 +422,19 @@ class SyncManager:
                     sender_name = sender.get("name", "")
                     sender_email = sender.get("address", "")
 
+                    # Parse recipients for sent/drafts folder display
+                    to_list = msg.get("to", [])
+                    if to_list:
+                        # Get first recipient for display
+                        first_to = to_list[0] if isinstance(to_list, list) else {}
+                        to_name = first_to.get("name", "") if isinstance(first_to, dict) else ""
+                        to_email = first_to.get("address", "") if isinstance(first_to, dict) else str(first_to)
+                        to_count = len(to_list) if isinstance(to_list, list) else 1
+                    else:
+                        to_name = ""
+                        to_email = ""
+                        to_count = 0
+
                     # Check for attachments - Kerio may use different field names
                     has_attachments = (msg.get("hasAttachment", False) or
                                       msg.get("hasAttachments", False) or
@@ -432,6 +445,9 @@ class SyncManager:
                         "subject": msg.get("subject", ""),
                         "sender_name": sender_name,
                         "sender_email": sender_email,
+                        "to_name": to_name,
+                        "to_email": to_email,
+                        "to_count": to_count,
                         "date_received": msg.get("receiveDate", ""),
                         "is_read": msg.get("isSeen", False),
                         "has_attachments": has_attachments,

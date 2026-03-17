@@ -11,11 +11,21 @@ from PySide6.QtWidgets import (
     QFileDialog, QMessageBox, QSizePolicy, QFrame, QCompleter,
     QMenu, QToolButton, QApplication
 )
-from PySide6.QtCore import Qt, Signal, QStringListModel
+from PySide6.QtCore import Qt, Signal, QStringListModel, QUrl
 from PySide6.QtGui import (
     QFont, QTextCharFormat, QAction, QKeySequence, QTextCursor,
     QTextBlockFormat
 )
+
+# Check for WebEngine availability
+HAS_WEBENGINE = False
+try:
+    from PySide6.QtWebEngineWidgets import QWebEngineView
+    from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
+    from PySide6.QtWebChannel import QWebChannel
+    HAS_WEBENGINE = True
+except ImportError:
+    pass
 
 
 class RichTextEdit(QTextEdit):
@@ -73,8 +83,265 @@ class RichTextEdit(QTextEdit):
             self.insertPlainText(mime.text())
 
 
+if HAS_WEBENGINE:
+    class WebEngineEditor(QWebEngineView):
+        """QWebEngineView-based rich text editor with contentEditable."""
+
+        def __init__(self, parent=None, font_size=12):
+            super().__init__(parent)
+            self._font_size = font_size
+            self._html_content = ""
+            self._ready = False
+
+            # Create page and allow JavaScript
+            page = QWebEnginePage(self)
+            self.setPage(page)
+
+            # Enable settings needed for editing
+            settings = self.settings()
+            settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+            settings.setAttribute(QWebEngineSettings.WebAttribute.FocusOnNavigationEnabled, True)
+
+            # Load editable HTML template
+            self._load_editor()
+
+            # Connect load finished to set ready flag
+            self.loadFinished.connect(self._on_load_finished)
+
+        def _load_editor(self):
+            """Load the editable HTML template."""
+            html = f'''<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+body {{
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    font-size: {self._font_size}pt;
+    margin: 8px;
+    padding: 0;
+    line-height: 1.2;
+}}
+p {{ margin: 0; padding: 0; }}
+</style>
+</head>
+<body contenteditable="true" id="editor">
+</body>
+</html>'''
+            self.setHtml(html)
+
+        def _on_load_finished(self, ok):
+            """Called when page finishes loading."""
+            self._ready = ok
+            if ok and self._html_content:
+                # Set any pending content
+                self._set_inner_html(self._html_content)
+                self._html_content = ""
+
+        def _set_inner_html(self, html):
+            """Set the innerHTML of the editor body."""
+            # Escape the HTML for JavaScript string
+            escaped = html.replace('\\', '\\\\').replace('`', '\\`').replace('$', '\\$')
+            js = f'document.getElementById("editor").innerHTML = `{escaped}`;'
+            self.page().runJavaScript(js)
+
+        def setHtml(self, html):
+            """Set HTML content (compatible with QTextEdit API)."""
+            # Extract body content if full HTML document
+            body_match = re.search(r'<body[^>]*>(.*)</body>', html, re.IGNORECASE | re.DOTALL)
+            if body_match:
+                content = body_match.group(1)
+            else:
+                content = html
+
+            if self._ready:
+                self._set_inner_html(content)
+            else:
+                # Store for when ready
+                self._html_content = content
+                # Also call parent setHtml to load the template
+                super().setHtml(self._get_template_with_content(content))
+
+        def _get_template_with_content(self, content):
+            """Get the editor template with content pre-filled."""
+            return f'''<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+body {{
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    font-size: {self._font_size}pt;
+    margin: 8px;
+    padding: 0;
+    line-height: 1.2;
+}}
+p {{ margin: 0; padding: 0; }}
+</style>
+</head>
+<body contenteditable="true" id="editor">
+{content}
+</body>
+</html>'''
+
+        def toHtml(self, callback=None):
+            """Get HTML content asynchronously.
+
+            If callback is provided, calls callback(html) when ready.
+            Otherwise returns cached content (may be stale).
+            """
+            if callback:
+                def handle_result(html):
+                    # Wrap in full HTML document
+                    full_html = f'''<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+body {{
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    font-size: {self._font_size}pt;
+    line-height: 1.2;
+}}
+p {{ margin: 0; padding: 0; }}
+</style>
+</head>
+<body>
+{html}
+</body>
+</html>'''
+                    callback(full_html)
+
+                self.page().runJavaScript(
+                    'document.getElementById("editor").innerHTML',
+                    handle_result
+                )
+            return self._html_content
+
+        def toHtmlSync(self):
+            """Get HTML content synchronously using event loop.
+
+            This blocks until the JavaScript returns.
+            """
+            from PySide6.QtCore import QEventLoop
+            loop = QEventLoop()
+            result = [None]
+
+            def callback(html):
+                result[0] = f'''<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+body {{
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    font-size: {self._font_size}pt;
+    line-height: 1.2;
+}}
+p {{ margin: 0; padding: 0; }}
+</style>
+</head>
+<body>
+{html}
+</body>
+</html>'''
+                loop.quit()
+
+            self.page().runJavaScript(
+                'document.getElementById("editor").innerHTML',
+                callback
+            )
+            loop.exec()
+            return result[0]
+
+        def execCommand(self, command, value=None):
+            """Execute a document.execCommand for formatting."""
+            if value:
+                js = f'document.execCommand("{command}", false, "{value}")'
+            else:
+                js = f'document.execCommand("{command}", false, null)'
+            self.page().runJavaScript(js)
+
+        def toggleBold(self):
+            """Toggle bold formatting."""
+            self.execCommand("bold")
+
+        def toggleItalic(self):
+            """Toggle italic formatting."""
+            self.execCommand("italic")
+
+        def toggleUnderline(self):
+            """Toggle underline formatting."""
+            self.execCommand("underline")
+
+        def insertBullet(self):
+            """Insert unordered list."""
+            self.execCommand("insertUnorderedList")
+
+        def setFontSize(self, size):
+            """Set font size."""
+            self._font_size = size
+            # fontSize command uses 1-7 scale, not pt
+            # We'll use CSS instead
+            self.page().runJavaScript(
+                f'document.getElementById("editor").style.fontSize = "{size}pt"'
+            )
+
+        def fontWeight(self):
+            """Check if current selection is bold (for button state)."""
+            # Return a placeholder - actual state checking is complex with WebEngine
+            return QFont.Weight.Normal
+
+        def fontItalic(self):
+            """Check if current selection is italic."""
+            return False
+
+        def fontUnderline(self):
+            """Check if current selection is underlined."""
+            return False
+
+        def setFocus(self):
+            """Set focus to the editor."""
+            super().setFocus()
+            self.page().runJavaScript('document.getElementById("editor").focus()')
+
+        def clear(self):
+            """Clear the editor content."""
+            if self._ready:
+                self.page().runJavaScript('document.getElementById("editor").innerHTML = ""')
+            self._html_content = ""
+
+        def setFont(self, font):
+            """Set the editor font (compatibility method)."""
+            self._font_size = font.pointSize()
+            if self._ready:
+                self.page().runJavaScript(
+                    f'document.getElementById("editor").style.fontSize = "{self._font_size}pt"'
+                )
+
+        def textCursor(self):
+            """Return a dummy cursor for compatibility."""
+            return _DummyCursor()
+
+        def setTextCursor(self, cursor):
+            """Set cursor position (no-op for WebEngine)."""
+            pass
+
+        def cursorPositionChanged(self):
+            """Dummy signal for compatibility."""
+            pass
+
+    class _DummyCursor:
+        """Dummy cursor class for API compatibility."""
+        def movePosition(self, *args, **kwargs):
+            pass
+        def setBlockFormat(self, *args, **kwargs):
+            pass
+
+
 class AddressLineEdit(QLineEdit):
-    """Line edit with email address autocomplete."""
+    """Line edit with email address autocomplete supporting multiple addresses."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -82,8 +349,10 @@ class AddressLineEdit(QLineEdit):
         self._completer = QCompleter(self)
         self._completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self._completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self._completer.setWidget(self)
         self._completer.activated.connect(self._insert_completion)
-        self.setCompleter(self._completer)
+        # Don't use setCompleter - we manage it manually for multi-address support
+        self.textChanged.connect(self._on_text_changed)
 
     def set_address_book(self, addresses):
         """Set the address book for autocompletion."""
@@ -114,16 +383,50 @@ class AddressLineEdit(QLineEdit):
 
         self._completer.setModel(QStringListModel(self._addresses, self._completer))
 
+    def _get_current_prefix(self):
+        """Get the text before the current address being typed."""
+        text = self.text()
+        cursor_pos = self.cursorPosition()
+        text_before_cursor = text[:cursor_pos]
+        if ',' in text_before_cursor:
+            return text_before_cursor.rsplit(',', 1)[0] + ', '
+        return ""
+
+    def _get_current_address_text(self):
+        """Get the address currently being typed (after the last comma)."""
+        text = self.text()
+        cursor_pos = self.cursorPosition()
+        text_before_cursor = text[:cursor_pos]
+        if ',' in text_before_cursor:
+            return text_before_cursor.rsplit(',', 1)[1].strip()
+        return text_before_cursor.strip()
+
+    def _on_text_changed(self, text):
+        """Handle text changes to show completer for current address."""
+        current_addr = self._get_current_address_text()
+        if len(current_addr) >= 1:
+            self._completer.setCompletionPrefix(current_addr)
+            if self._completer.completionCount() > 0:
+                self._completer.complete()
+        else:
+            self._completer.popup().hide()
+
     def _insert_completion(self, text):
         """Insert selected completion, handling comma-separated addresses."""
-        current = self.text()
-        if ',' in current:
-            prefix = current.rsplit(',', 1)[0] + ', '
-        else:
-            prefix = ""
+        prefix = self._get_current_prefix()
+        # Get any text after cursor (in case user is editing in the middle)
+        cursor_pos = self.cursorPosition()
+        full_text = self.text()
+        text_after_cursor = full_text[cursor_pos:]
 
-        self.setText(prefix + text)
-        self.setCursorPosition(len(self.text()))
+        # Find if there's more text after current address
+        suffix = ""
+        if ',' in text_after_cursor:
+            suffix = ',' + text_after_cursor.split(',', 1)[1]
+
+        self.setText(prefix + text + suffix)
+        # Position cursor after the inserted address
+        self.setCursorPosition(len(prefix + text))
 
 
 class ComposeWidget(QWidget):
@@ -288,19 +591,20 @@ class ComposeWidget(QWidget):
         format_bar.addStretch()
         layout.addLayout(format_bar)
 
-        # Body editor
-        self.body_edit = RichTextEdit()
-        # Use a proper sans-serif font with zoom applied
-        body_font = QFont("Sans Serif")
-        body_font.setPointSize(int(self._font_size * self._zoom))
-        self.body_edit.setFont(body_font)
-        self.body_edit.cursorPositionChanged.connect(self._update_format_buttons)
-
-        # Set tab stop width (4 spaces worth)
-        self.body_edit.setTabStopDistance(40)
-
-        # Set default paragraph spacing (tighter than Qt default)
-        self._set_default_paragraph_format()
+        # Body editor - use WebEngine if available for proper HTML/image support
+        font_size = int(self._font_size * self._zoom)
+        if HAS_WEBENGINE:
+            self.body_edit = WebEngineEditor(font_size=font_size)
+            self._use_webengine = True
+        else:
+            self.body_edit = RichTextEdit()
+            body_font = QFont("Sans Serif")
+            body_font.setPointSize(font_size)
+            self.body_edit.setFont(body_font)
+            self.body_edit.cursorPositionChanged.connect(self._update_format_buttons)
+            self.body_edit.setTabStopDistance(40)
+            self._set_default_paragraph_format()
+            self._use_webengine = False
 
         layout.addWidget(self.body_edit, 1)
 
@@ -361,35 +665,47 @@ class ComposeWidget(QWidget):
 
     def _toggle_bold(self):
         """Toggle bold formatting."""
-        fmt = QTextCharFormat()
-        if self.body_edit.fontWeight() == QFont.Weight.Bold:
-            fmt.setFontWeight(QFont.Weight.Normal)
+        if self._use_webengine:
+            self.body_edit.toggleBold()
         else:
-            fmt.setFontWeight(QFont.Weight.Bold)
-        self._merge_format(fmt)
-        self._update_format_buttons()
+            fmt = QTextCharFormat()
+            if self.body_edit.fontWeight() == QFont.Weight.Bold:
+                fmt.setFontWeight(QFont.Weight.Normal)
+            else:
+                fmt.setFontWeight(QFont.Weight.Bold)
+            self._merge_format(fmt)
+            self._update_format_buttons()
 
     def _toggle_italic(self):
         """Toggle italic formatting."""
-        fmt = QTextCharFormat()
-        fmt.setFontItalic(not self.body_edit.fontItalic())
-        self._merge_format(fmt)
-        self._update_format_buttons()
+        if self._use_webengine:
+            self.body_edit.toggleItalic()
+        else:
+            fmt = QTextCharFormat()
+            fmt.setFontItalic(not self.body_edit.fontItalic())
+            self._merge_format(fmt)
+            self._update_format_buttons()
 
     def _toggle_underline(self):
         """Toggle underline formatting."""
-        fmt = QTextCharFormat()
-        fmt.setFontUnderline(not self.body_edit.fontUnderline())
-        self._merge_format(fmt)
-        self._update_format_buttons()
+        if self._use_webengine:
+            self.body_edit.toggleUnderline()
+        else:
+            fmt = QTextCharFormat()
+            fmt.setFontUnderline(not self.body_edit.fontUnderline())
+            self._merge_format(fmt)
+            self._update_format_buttons()
 
     def _change_font_size(self, size_str):
         """Change font size."""
         try:
             size = int(size_str)
-            fmt = QTextCharFormat()
-            fmt.setFontPointSize(size)
-            self._merge_format(fmt)
+            if self._use_webengine:
+                self.body_edit.setFontSize(size)
+            else:
+                fmt = QTextCharFormat()
+                fmt.setFontPointSize(size)
+                self._merge_format(fmt)
         except ValueError:
             pass
 
@@ -409,7 +725,10 @@ class ComposeWidget(QWidget):
 
     def _insert_bullet(self):
         """Insert bullet point."""
-        self.body_edit.insertPlainText("• ")
+        if self._use_webengine:
+            self.body_edit.insertBullet()
+        else:
+            self.body_edit.insertPlainText("• ")
 
     def _paste(self):
         """Paste clipboard contents at cursor position."""
@@ -742,6 +1061,7 @@ class ComposeWidget(QWidget):
 
         # Quote original with left border bar style
         orig_body = original_message.get('body', '')
+        body_type = original_message.get('body_type', 'text')
         date = original_message.get('date', '')
 
         if date and len(date) >= 15:
@@ -756,9 +1076,27 @@ class ComposeWidget(QWidget):
         sender_str = f"{from_name} &lt;{from_email}&gt;" if from_name else html_module.escape(from_email)
         quote_header = f"On {date}, {sender_str} wrote:" if date else f"{sender_str} wrote:"
 
-        # Convert HTML to plain text and escape for HTML
-        plain_body = self._html_to_plain_text(orig_body)
-        escaped_body = html_module.escape(plain_body).replace('\n', '<br>')
+        # Preserve HTML body or convert plain text to HTML
+        if body_type == 'html':
+            # Strip outer html/body tags but keep the content
+            body_html = orig_body
+            # Remove doctype, html, head, body tags but keep content
+            body_html = re.sub(r'<!DOCTYPE[^>]*>', '', body_html, flags=re.IGNORECASE)
+            body_html = re.sub(r'<html[^>]*>', '', body_html, flags=re.IGNORECASE)
+            body_html = re.sub(r'</html>', '', body_html, flags=re.IGNORECASE)
+            body_html = re.sub(r'<head[^>]*>.*?</head>', '', body_html, flags=re.IGNORECASE | re.DOTALL)
+            body_html = re.sub(r'<body[^>]*>', '', body_html, flags=re.IGNORECASE)
+            body_html = re.sub(r'</body>', '', body_html, flags=re.IGNORECASE)
+            # Remove remote images only for QTextEdit - WebEngine can load them
+            if not self._use_webengine:
+                body_html = re.sub(r'<img[^>]*src\s*=\s*["\']https?://[^"\']*["\'][^>]*>', '', body_html, flags=re.IGNORECASE)
+            # Always remove about:blank images (blocked images)
+            body_html = re.sub(r'<img[^>]*src\s*=\s*["\']about:blank["\'][^>]*>', '', body_html, flags=re.IGNORECASE)
+            quoted_body = body_html.strip()
+        else:
+            # Convert plain text to HTML
+            plain_body = self._html_to_plain_text(orig_body)
+            quoted_body = html_module.escape(plain_body).replace('\n', '<br>')
 
         # Build HTML with table-based left border (QTextEdit doesn't support border-left CSS)
         # Signature goes between reply area and quoted text
@@ -771,7 +1109,7 @@ class ComposeWidget(QWidget):
 <table border="0" cellspacing="0" cellpadding="0">
 <tr>
 <td style="background-color: #ccc; width: 3px;"></td>
-<td style="padding-left: 10px; color: #555;">{escaped_body}</td>
+<td style="padding-left: 10px;">{quoted_body}</td>
 </tr>
 </table>
 </body></html>'''
@@ -806,6 +1144,7 @@ class ComposeWidget(QWidget):
         date = original_message.get('date', '')
         to = original_message.get('to', '')
         body = original_message.get('body', '')
+        body_type = original_message.get('body_type', 'text')
 
         if date and len(date) >= 15:
             try:
@@ -821,9 +1160,27 @@ class ComposeWidget(QWidget):
         escaped_subject = html_module.escape(original_message.get('subject', ''))
         escaped_to = html_module.escape(to)
 
-        # Convert HTML to plain text and escape for HTML
-        plain_body = self._html_to_plain_text(body)
-        escaped_body = html_module.escape(plain_body).replace('\n', '<br>')
+        # Preserve HTML body or convert plain text to HTML
+        if body_type == 'html':
+            # Strip outer html/body tags but keep the content
+            body_html = body
+            # Remove doctype, html, head, body tags but keep content
+            body_html = re.sub(r'<!DOCTYPE[^>]*>', '', body_html, flags=re.IGNORECASE)
+            body_html = re.sub(r'<html[^>]*>', '', body_html, flags=re.IGNORECASE)
+            body_html = re.sub(r'</html>', '', body_html, flags=re.IGNORECASE)
+            body_html = re.sub(r'<head[^>]*>.*?</head>', '', body_html, flags=re.IGNORECASE | re.DOTALL)
+            body_html = re.sub(r'<body[^>]*>', '', body_html, flags=re.IGNORECASE)
+            body_html = re.sub(r'</body>', '', body_html, flags=re.IGNORECASE)
+            # Remove remote images only for QTextEdit - WebEngine can load them
+            if not self._use_webengine:
+                body_html = re.sub(r'<img[^>]*src\s*=\s*["\']https?://[^"\']*["\'][^>]*>', '', body_html, flags=re.IGNORECASE)
+            # Always remove about:blank images (blocked images)
+            body_html = re.sub(r'<img[^>]*src\s*=\s*["\']about:blank["\'][^>]*>', '', body_html, flags=re.IGNORECASE)
+            forwarded_body = body_html.strip()
+        else:
+            # Convert plain text to HTML
+            plain_body = self._html_to_plain_text(body)
+            forwarded_body = html_module.escape(plain_body).replace('\n', '<br>')
 
         # Build HTML with table-based left border (QTextEdit doesn't support border-left CSS)
         # Signature goes between message area and forwarded content
@@ -843,7 +1200,7 @@ class ComposeWidget(QWidget):
 <b>Subject:</b> {escaped_subject}<br>
 <b>To:</b> {escaped_to}
 </p>
-<p style="color: #555;">{escaped_body}</p>
+<div>{forwarded_body}</div>
 </td>
 </tr>
 </table>
@@ -862,7 +1219,10 @@ class ComposeWidget(QWidget):
 
     def _get_html_body(self):
         """Convert rich text to HTML with proper styling."""
-        html = self.body_edit.toHtml()
+        if self._use_webengine:
+            html = self.body_edit.toHtmlSync()
+        else:
+            html = self.body_edit.toHtml()
 
         # Web-safe sans-serif font stack
         font_stack = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
@@ -943,11 +1303,15 @@ class ComposeWidget(QWidget):
 
     def _get_current_state(self):
         """Get current state of all fields for change detection."""
+        if self._use_webengine:
+            body_html = self.body_edit.toHtmlSync()
+        else:
+            body_html = self.body_edit.toHtml()
         return {
             'to': self.to_edit.text(),
             'cc': self.cc_edit.text(),
             'subject': self.subject_edit.text(),
-            'body': self.body_edit.toHtml(),
+            'body': body_html,
             'from_idx': self.from_combo.currentIndex(),
             'attachments': len(self._attachments)
         }
@@ -984,10 +1348,13 @@ class ComposeWidget(QWidget):
         """Set zoom level for the compose body."""
         self._zoom = zoom_factor
         size = int(self._font_size * zoom_factor)
-        font = QFont("Sans Serif")
-        font.setPointSize(size)
-        self.body_edit.setFont(font)
-        self.body_edit.viewport().update()
+        if self._use_webengine:
+            self.body_edit.setFontSize(size)
+        else:
+            font = QFont("Sans Serif")
+            font.setPointSize(size)
+            self.body_edit.setFont(font)
+            self.body_edit.viewport().update()
 
     def _apply_theme(self):
         """Apply dark/light theme - now using system defaults."""
