@@ -1,6 +1,6 @@
 # Mailbench
 
-A desktop email client for Kerio Connect mail servers, built with Python and Tkinter.
+A desktop email client for Kerio Connect mail servers, built with Python and QT.
 
 ## Features
 
