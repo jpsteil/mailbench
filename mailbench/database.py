@@ -317,6 +317,28 @@ class Database:
             cursor = conn.execute("SELECT email FROM trusted_senders ORDER BY email")
             return [row[0] for row in cursor.fetchall()]
 
+    def clear_trusted_senders(self):
+        """Clear all trusted senders (used before syncing from server)."""
+        with self._get_conn() as conn:
+            conn.execute("DELETE FROM trusted_senders")
+            conn.commit()
+
+    def bulk_add_trusted_senders(self, emails: list):
+        """Bulk add trusted senders from server sync.
+
+        emails: list of email strings
+        """
+        with self._get_conn() as conn:
+            for email in emails:
+                email = email.strip().lower() if email else ''
+                if not email:
+                    continue
+                conn.execute(
+                    "INSERT OR IGNORE INTO trusted_senders (email) VALUES (?)",
+                    (email,)
+                )
+            conn.commit()
+
     # ==================== Accounts ====================
 
     def get_accounts(self):

@@ -27,7 +27,7 @@ except ImportError:
 from PySide6.QtCore import (
     Qt, QAbstractListModel, QModelIndex, QSize, Signal, Slot,
     QTimer, QThread, QObject, QSettings, QMetaObject, Q_ARG, QGenericArgument,
-    QEvent, QPoint
+    QEvent, QPoint, QMimeData
 )
 from PySide6.QtGui import (
     QFont, QFontMetrics, QPainter, QColor, QPen, QBrush, QAction,
@@ -39,6 +39,7 @@ from mailbench.database import Database
 from mailbench.kerio_client import KerioConnectionPool, SyncManager, KerioConfig
 from mailbench.blocklist import BlocklistManager
 from mailbench.version import __version__
+from mailbench.views.folder_panel import FolderPanel
 
 
 def get_icon(theme_names: list, standard_pixmap: QStyle.StandardPixmap = None) -> QIcon:
@@ -850,175 +851,6 @@ class MessageDelegate(QStyledItemDelegate):
         return super().editorEvent(event, model, option, index)
 
 
-class FolderTreeModel(QStandardItemModel):
-    """Model for the folder tree."""
-
-    # Signal emitted when messages are dropped on a folder (item_ids, account_id, folder_id)
-    messagesDropped = Signal(list, int, str)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setHorizontalHeaderLabels(["Accounts"])
-        self._account_items: dict[int, QStandardItem] = {}
-        self._folder_items: dict[str, QStandardItem] = {}  # "account_id:folder_id" -> item
-        self._folders_group_items: dict[int, QStandardItem] = {}  # account_id -> "Folders" group item
-
-    def add_account(self, account_id: int, name: str, connected: bool = False):
-        """Add an account to the tree."""
-        if account_id in self._account_items:
-            item = self._account_items[account_id]
-            item.setText(f"{name} (connected)" if connected else name)
-            return item
-
-        item = QStandardItem(f"{name} (connected)" if connected else name)
-        item.setData(("account", account_id), Qt.ItemDataRole.UserRole)
-        item.setEditable(False)
-        self.appendRow(item)
-        self._account_items[account_id] = item
-        return item
-
-    def add_folder(self, account_id: int, folder_id: str, name: str, unread_count: int = 0, is_base_folder: bool = True):
-        """Add a folder under an account or under the Folders group."""
-        if account_id not in self._account_items:
-            return None
-
-        key = f"{account_id}:{folder_id}"
-        if key in self._folder_items:
-            item = self._folder_items[key]
-            display = f"{name} ({unread_count})" if unread_count > 0 else name
-            item.setText(display)
-            return item
-
-        # Determine parent - base folders go under account, others under "Folders" group
-        if is_base_folder:
-            parent = self._account_items[account_id]
-        else:
-            parent = self._get_or_create_folders_group(account_id)
-
-        display = f"{name} ({unread_count})" if unread_count > 0 else name
-        item = QStandardItem(display)
-        item.setData(("folder", account_id, folder_id), Qt.ItemDataRole.UserRole)
-        item.setEditable(False)
-
-        # Set icon for base folders
-        if is_base_folder:
-            icon = self._get_folder_icon(name.lower())
-            if icon:
-                item.setIcon(icon)
-
-        parent.appendRow(item)
-        self._folder_items[key] = item
-        return item
-
-    def _get_folder_icon(self, folder_name: str) -> Optional[QIcon]:
-        """Get icon for a folder based on its name."""
-        # Use DirIcon as fallback for all folder types
-        fallback = QStyle.StandardPixmap.SP_DirIcon
-        if 'inbox' in folder_name:
-            return get_icon(["mail-inbox", "folder"], fallback)
-        elif 'sent' in folder_name:
-            return get_icon(["mail-sent", "folder"], fallback)
-        elif 'draft' in folder_name:
-            return get_icon(["mail-drafts", "folder"], fallback)
-        elif 'spam' in folder_name or 'junk' in folder_name:
-            return get_icon(["mail-mark-junk", "folder"], fallback)
-        elif 'trash' in folder_name or 'deleted' in folder_name:
-            return get_icon(["user-trash", "folder"], QStyle.StandardPixmap.SP_TrashIcon)
-        return None
-
-    def _get_or_create_folders_group(self, account_id: int) -> QStandardItem:
-        """Get or create the 'Folders' group item for an account."""
-        if account_id in self._folders_group_items:
-            return self._folders_group_items[account_id]
-
-        parent = self._account_items[account_id]
-        group_item = QStandardItem("Folders")
-        group_item.setData(("folders_group", account_id), Qt.ItemDataRole.UserRole)
-        group_item.setEditable(False)
-        parent.appendRow(group_item)
-        self._folders_group_items[account_id] = group_item
-        return group_item
-
-    def get_folders_group_item(self, account_id: int) -> Optional[QStandardItem]:
-        """Get the Folders group item for an account."""
-        return self._folders_group_items.get(account_id)
-
-    def clear_folders(self, account_id: int):
-        """Clear folders for an account."""
-        if account_id not in self._account_items:
-            return
-        parent = self._account_items[account_id]
-        parent.removeRows(0, parent.rowCount())
-        # Remove from folder map
-        keys_to_remove = [k for k in self._folder_items if k.startswith(f"{account_id}:")]
-        for k in keys_to_remove:
-            del self._folder_items[k]
-        # Remove folders group reference
-        if account_id in self._folders_group_items:
-            del self._folders_group_items[account_id]
-
-    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
-        """Return item flags - enable dropping on folder items."""
-        default_flags = super().flags(index)
-        if index.isValid():
-            item = self.itemFromIndex(index)
-            if item:
-                data = item.data(Qt.ItemDataRole.UserRole)
-                # Enable drop only on folder items
-                if data and data[0] == "folder":
-                    return default_flags | Qt.ItemFlag.ItemIsDropEnabled
-        return default_flags
-
-    def mimeTypes(self) -> list[str]:
-        """Return supported MIME types for drop."""
-        return ["application/x-mailbench-message"]
-
-    def supportedDropActions(self) -> Qt.DropAction:
-        """Return supported drop actions."""
-        return Qt.DropAction.MoveAction
-
-    def canDropMimeData(self, data, action, row, column, parent) -> bool:
-        """Check if drop is allowed."""
-        if not data.hasFormat("application/x-mailbench-message"):
-            return False
-        if not parent.isValid():
-            return False
-        item = self.itemFromIndex(parent)
-        if item:
-            item_data = item.data(Qt.ItemDataRole.UserRole)
-            # Only allow drop on folder items
-            return item_data and item_data[0] == "folder"
-        return False
-
-    def dropMimeData(self, data, action, row, column, parent) -> bool:
-        """Handle the drop - move messages to folder."""
-        if not data.hasFormat("application/x-mailbench-message"):
-            return False
-        if not parent.isValid():
-            return False
-
-        item = self.itemFromIndex(parent)
-        if not item:
-            return False
-
-        item_data = item.data(Qt.ItemDataRole.UserRole)
-        if not item_data or item_data[0] != "folder":
-            return False
-
-        account_id = item_data[1]
-        folder_id = item_data[2]
-
-        # Parse the dropped message IDs
-        raw_data = data.data("application/x-mailbench-message").data().decode()
-        item_ids = [id.strip() for id in raw_data.split(",") if id.strip()]
-
-        if item_ids:
-            # Emit signal with the message IDs and target folder
-            self.messagesDropped.emit(item_ids, account_id, folder_id)
-
-        return True
-
-
 class FilterLineEdit(QLineEdit):
     """Line edit that emits signal when down arrow is pressed."""
 
@@ -1730,33 +1562,19 @@ class MailbenchWindow(QMainWindow):
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
         layout.addWidget(self._splitter)
 
-        # Left pane - Folder tree
+        # Left pane - Folder panel
         folder_widget = QWidget()
         folder_layout = QVBoxLayout(folder_widget)
         folder_layout.setContentsMargins(0, 0, 0, 0)
         folder_layout.setSpacing(0)
 
-        self._folder_model = FolderTreeModel()
-        self._folder_model.messagesDropped.connect(self._on_messages_dropped)
-        self._folder_tree = QTreeView()
-        self._folder_tree.setModel(self._folder_model)
-        self._folder_tree.setHeaderHidden(True)
-        self._folder_tree.setAnimated(True)
-        self._folder_tree.setIndentation(12)  # Reduce indent depth
-        self._folder_tree.clicked.connect(self._on_folder_clicked)
-        self._folder_tree.doubleClicked.connect(self._on_folder_double_clicked)
-        self._folder_tree.expanded.connect(self._on_folder_expanded)
-        self._folder_tree.collapsed.connect(self._on_folder_collapsed)
-        # Enable drop
-        self._folder_tree.setAcceptDrops(True)
-        self._folder_tree.setDropIndicatorShown(True)
-        self._folder_tree.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
-        # Context menu for folder operations
-        self._folder_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self._folder_tree.customContextMenuRequested.connect(self._show_folder_context_menu)
-        folder_layout.addWidget(self._folder_tree)
+        self._folder_panel = FolderPanel()
+        self._folder_panel.folderSelected.connect(self._on_folder_selected)
+        self._folder_panel.messagesDropped.connect(self._on_messages_dropped_panel)
+        self._folder_panel.contextMenuRequested.connect(self._on_folder_context_menu)
+        folder_layout.addWidget(self._folder_panel)
 
-        # Block drop zones at bottom of folder tree (hidden until drag starts)
+        # Block drop zones at bottom of folder panel (hidden until drag starts)
         self._block_frame = QFrame()
         self._block_frame.setFrameStyle(QFrame.Shape.StyledPanel)
         block_layout = QVBoxLayout(self._block_frame)
@@ -2040,6 +1858,9 @@ class MailbenchWindow(QMainWindow):
         self._message_delegate.set_font_size(self.font_size)
         self._message_list.viewport().update()
 
+        # Update folder panel
+        self._folder_panel.update_font()
+
     def eventFilter(self, obj, event):
         """Filter events for Ctrl+scroll zoom on child widgets."""
         if event.type() == event.Type.Wheel:
@@ -2156,8 +1977,6 @@ class MailbenchWindow(QMainWindow):
     def _load_accounts(self):
         """Load accounts from database."""
         accounts = self.db.get_accounts()
-        for account in accounts:
-            self._folder_model.add_account(account['id'], account['email'])
 
         # Auto-connect first account
         if accounts:
@@ -2191,7 +2010,7 @@ class MailbenchWindow(QMainWindow):
         """Handle connection result."""
         if success:
             self.connected_accounts.add(account_id)
-            self._folder_model.add_account(account_id, email, connected=True)
+            self._folder_panel.set_account(account_id, email.split('@')[0], email, connected=True)
             self._statusbar.showMessage(f"Connected to {email}")
             self._load_folders(account_id)
             self._load_address_book(account_id)
@@ -2324,7 +2143,7 @@ class MailbenchWindow(QMainWindow):
             if success:
                 # Read folders from database (sync_folders saves them there)
                 folders = self.db.get_folders(account_id)
-                self._folder_model.clear_folders(account_id)
+                self._folder_panel.clear_folders(account_id)
 
                 # Sort folders: standard folders first in specific order
                 standard_order = ['inbox', 'sent', 'drafts', 'junk', 'spam', 'trash']
@@ -2370,7 +2189,7 @@ class MailbenchWindow(QMainWindow):
                     # Determine if this is a base folder
                     is_base = any(std in name for std in standard_order) or 'deleted items' in name
 
-                    self._folder_model.add_folder(
+                    self._folder_panel.add_folder(
                         account_id,
                         folder['folder_id'],
                         folder['name'],
@@ -2378,21 +2197,10 @@ class MailbenchWindow(QMainWindow):
                         is_base_folder=is_base
                     )
 
-                # Expand account node
-                for i in range(self._folder_model.rowCount()):
-                    idx = self._folder_model.index(i, 0)
-                    self._folder_tree.expand(idx)
-
-                # Restore "Folders" group expanded state
+                # Restore "Folders" section expanded state
                 settings = QSettings("Mailbench", "Mailbench")
                 folders_expanded = settings.value(f"folders_expanded_{account_id}", True, type=bool)
-                folders_group = self._folder_model.get_folders_group_item(account_id)
-                if folders_group:
-                    folders_idx = self._folder_model.indexFromItem(folders_group)
-                    if folders_expanded:
-                        self._folder_tree.expand(folders_idx)
-                    else:
-                        self._folder_tree.collapse(folders_idx)
+                self._folder_panel.set_folders_expanded(folders_expanded)
 
                 # Select inbox only on initial connection (no folder selected yet)
                 if not self._current_folder_id:
@@ -2404,65 +2212,25 @@ class MailbenchWindow(QMainWindow):
 
     def _select_inbox(self, account_id: int):
         """Select the inbox folder."""
-        # Find inbox in the folder items
-        for key, item in self._folder_model._folder_items.items():
-            if key.startswith(f"{account_id}:"):
-                data = item.data(Qt.ItemDataRole.UserRole)
-                if data and len(data) >= 3:
-                    folder_name = item.text().lower()
-                    if 'inbox' in folder_name:
-                        # Select this item
-                        idx = self._folder_model.indexFromItem(item)
-                        self._folder_tree.setCurrentIndex(idx)
-                        self._load_messages(account_id, data[2])
-                        break
+        # Find inbox folder ID from database
+        folders = self.db.get_folders(account_id)
+        for folder in folders:
+            if 'inbox' in folder['name'].lower():
+                self._folder_panel.select_folder(account_id, folder['folder_id'])
+                self._load_messages(account_id, folder['folder_id'])
+                break
 
-    def _on_folder_clicked(self, index: QModelIndex):
-        """Handle folder selection."""
-        item = self._folder_model.itemFromIndex(index)
-        if not item:
-            return
+    def _on_folder_selected(self, account_id: int, folder_id: str, folder_name: str):
+        """Handle folder selection from panel."""
+        self._load_messages(account_id, folder_id)
 
-        data = item.data(Qt.ItemDataRole.UserRole)
-        if not data:
-            return
-
-        if data[0] == "folder":
-            account_id = data[1]
-            folder_id = data[2]
-            self._load_messages(account_id, folder_id)
-
-    def _on_folder_double_clicked(self, index: QModelIndex):
-        """Handle folder double-click (connect if account)."""
-        item = self._folder_model.itemFromIndex(index)
-        if not item:
-            return
-
-        data = item.data(Qt.ItemDataRole.UserRole)
-        if data and data[0] == "account":
-            account_id = data[1]
-            if account_id not in self.connected_accounts:
-                self._connect_account(account_id)
-
-    def _on_folder_expanded(self, index: QModelIndex):
-        """Save expanded state for Folders group."""
-        item = self._folder_model.itemFromIndex(index)
-        if item:
-            data = item.data(Qt.ItemDataRole.UserRole)
-            if data and data[0] == "folders_group":
-                account_id = data[1]
-                settings = QSettings("Mailbench", "Mailbench")
-                settings.setValue(f"folders_expanded_{account_id}", True)
-
-    def _on_folder_collapsed(self, index: QModelIndex):
-        """Save collapsed state for Folders group."""
-        item = self._folder_model.itemFromIndex(index)
-        if item:
-            data = item.data(Qt.ItemDataRole.UserRole)
-            if data and data[0] == "folders_group":
-                account_id = data[1]
-                settings = QSettings("Mailbench", "Mailbench")
-                settings.setValue(f"folders_expanded_{account_id}", False)
+        # Save expanded state when FOLDERS section is toggled
+        if self._current_account_id:
+            settings = QSettings("Mailbench", "Mailbench")
+            settings.setValue(
+                f"folders_expanded_{self._current_account_id}",
+                self._folder_panel.is_folders_expanded()
+            )
 
     # ==================== Message Methods ====================
 
@@ -2728,7 +2496,7 @@ class MailbenchWindow(QMainWindow):
         self._images_blocked = False
 
         # Check if sender is trusted for remote images
-        sender_trusted = self.db.is_trusted_sender(self._current_sender_email) if self._current_sender_email else False
+        sender_trusted = self.blocklist_manager.is_trusted_sender(self._current_sender_email) if self._current_sender_email else False
 
         if self._use_webengine:
             # WebEngineView handles HTML natively
@@ -2833,8 +2601,8 @@ class MailbenchWindow(QMainWindow):
         if not self._current_sender_email:
             return
 
-        self.db.add_trusted_sender(self._current_sender_email)
-        self._statusbar.showMessage(f"Added {self._current_sender_email} to trusted senders")
+        self.blocklist_manager.add_trusted_sender(self._current_sender_email)
+        self._statusbar.showMessage(f"Added {self._current_sender_email} to trusted senders (synced)")
         self._load_images_once()
 
     def _clear_attachments_display(self):
@@ -3315,26 +3083,10 @@ class MailbenchWindow(QMainWindow):
 
         menu.exec_(self._message_list.mapToGlobal(position))
 
-    def _show_folder_context_menu(self, position):
-        """Show context menu for folder tree."""
-        index = self._folder_tree.indexAt(position)
-        if not index.isValid():
-            return
-
-        item = self._folder_model.itemFromIndex(index)
-        if not item:
-            return
-
-        data = item.data(Qt.ItemDataRole.UserRole)
-        if not data or data[0] != "folder":
-            return
-
-        account_id = data[1]
-        folder_id = data[2]
-        folder_name = item.text().lower()
-
+    def _on_folder_context_menu(self, position: QPoint, account_id: int, folder_id: str, folder_name: str):
+        """Show context menu for folder."""
         # Check if this is a trash/deleted folder
-        is_trash = 'trash' in folder_name or 'deleted' in folder_name
+        is_trash = 'trash' in folder_name.lower() or 'deleted' in folder_name.lower()
 
         if not is_trash:
             return  # No context menu for non-trash folders (for now)
@@ -3342,7 +3094,7 @@ class MailbenchWindow(QMainWindow):
         menu = QMenu(self)
         empty_action = menu.addAction("Empty Trash")
         empty_action.triggered.connect(lambda: self._empty_trash(account_id, folder_id))
-        menu.exec_(self._folder_tree.mapToGlobal(position))
+        menu.exec_(position)
 
     def _empty_trash(self, account_id: int, folder_id: str):
         """Empty the trash folder - permanently delete all messages."""
@@ -3459,6 +3211,16 @@ class MailbenchWindow(QMainWindow):
             self._message_list.setFocus()
         else:
             self._statusbar.showMessage(f"Move failed: {error}")
+
+    def _on_messages_dropped_panel(self, mime_data: QMimeData, account_id: int, folder_id: str):
+        """Handle messages dropped on a folder panel item."""
+        if not mime_data.hasFormat("application/x-mailbench-messages"):
+            return
+
+        import json
+        data = bytes(mime_data.data("application/x-mailbench-messages")).decode('utf-8')
+        item_ids = json.loads(data)
+        self._on_messages_dropped(item_ids, account_id, folder_id)
 
     def _on_messages_dropped(self, item_ids: list, account_id: int, folder_id: str):
         """Handle messages dropped on a folder (drag and drop)."""
@@ -3799,9 +3561,7 @@ class MailbenchWindow(QMainWindow):
     def _refresh_accounts(self):
         """Refresh account list after changes."""
         # Clear and reload
-        self._folder_model.clear()
-        self._folder_model._account_items.clear()
-        self._folder_model._folder_items.clear()
+        self._folder_panel.clear_all()
         self._load_accounts()
 
     def _show_settings(self):

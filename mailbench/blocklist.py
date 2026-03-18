@@ -121,6 +121,7 @@ class BlocklistManager:
             data = json.loads(body)
             # Clear existing and load fresh from server
             self.db.clear_blocklist()
+            self.db.clear_trusted_senders()
 
             domains = data.get("domains", [])
             if domains:
@@ -134,6 +135,11 @@ class BlocklistManager:
             allowed = data.get("allowed_domains", [])
             if allowed:
                 self.db.bulk_add_allowed_domains(allowed)
+
+            # Load trusted senders for remote images
+            trusted = data.get("trusted_senders", [])
+            if trusted:
+                self.db.bulk_add_trusted_senders(trusted)
         except json.JSONDecodeError:
             pass  # Invalid JSON, ignore
 
@@ -142,6 +148,7 @@ class BlocklistManager:
         domains = self.db.get_blocked_domains()
         emails = self.db.get_blocked_emails()
         allowed = self.db.get_allowed_domains()
+        trusted = self.db.get_trusted_senders()
 
         data = {
             "version": 1,
@@ -156,7 +163,8 @@ class BlocklistManager:
                 "blocked_count": e["blocked_count"],
                 "last_blocked": e["last_blocked"]
             } for e in emails],
-            "allowed_domains": [e["domain"] for e in allowed]
+            "allowed_domains": [e["domain"] for e in allowed],
+            "trusted_senders": trusted
         }
         return json.dumps(data, indent=2)
 
@@ -260,6 +268,27 @@ class BlocklistManager:
     def is_allowed(self, domain: str) -> bool:
         """Check if domain is in allowed list."""
         return self.db.is_allowed_domain(domain)
+
+    # ==================== Trusted Senders (for remote images) ====================
+
+    def add_trusted_sender(self, email: str, callback: Optional[Callable] = None):
+        """Add an email to trusted senders list (local + server sync)."""
+        email = email.lower().strip()
+        self.db.add_trusted_sender(email)
+        self._save_to_server(callback=callback)
+
+    def remove_trusted_sender(self, email: str, callback: Optional[Callable] = None):
+        """Remove an email from trusted senders list (local + server sync)."""
+        self.db.remove_trusted_sender(email)
+        self._save_to_server(callback=callback)
+
+    def is_trusted_sender(self, email: str) -> bool:
+        """Check if sender is in trusted list for remote images."""
+        return self.db.is_trusted_sender(email)
+
+    def get_trusted_senders(self) -> list:
+        """Get all trusted sender emails."""
+        return self.db.get_trusted_senders()
 
     def start_periodic_sync(self, interval_ms: int = 600000):
         """Start periodic sync from server (default: 10 minutes)."""
