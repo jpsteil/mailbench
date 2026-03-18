@@ -1,18 +1,30 @@
 # Mailbench
 
-A desktop email client for Kerio Connect mail servers, built with Python and QT.
+A desktop email client for Kerio Connect mail servers, built with Python and Qt.
 
 ## Features
 
 - **Multi-account support** - Connect to multiple Kerio Connect servers
 - **3-pane layout** - Folders, message list, and preview pane
-- **Dark/light themes** - Toggle between themes with Ctrl+D
 - **Compose, Reply, Forward** - Full email composition with HTML support
+- **WebEngine-based editor** - Rich HTML compose with inline image support
 - **Attachments** - View, download, and attach files
 - **Address book integration** - Autocomplete from Kerio contacts and cached addresses
 - **Local caching** - SQLite database for offline message access
+- **Drag and drop** - Move messages between folders
+- **Block sender/domain** - Drag messages to block folders
+- **Message flagging** - Flag important messages
 - **Keyboard shortcuts** - Efficient navigation and actions
-- **Zoom support** - Ctrl+scroll to adjust preview size
+- **Zoom support** - Ctrl+scroll or shortcuts to adjust preview size
+
+## Security Features
+
+- **Remote image blocking** - Prevents email tracking pixels
+- **External link warnings** - Shows domain before opening links
+- **Phishing detection** - Warns about homograph/lookalike domains
+- **Dangerous attachment warnings** - Alerts for executable files
+- **HTML sanitization** - XSS protection for message display
+- **Secure credential storage** - Uses system keyring for passwords
 
 ## Requirements
 
@@ -42,6 +54,8 @@ mailbench
 
 On first run, go to **Accounts > Add Account** to configure your Kerio Connect server.
 
+The status bar displays a permanent zoom indicator showing the current preview zoom level.
+
 ## Keyboard Shortcuts
 
 | Shortcut | Action |
@@ -50,8 +64,11 @@ On first run, go to **Accounts > Add Account** to configure your Kerio Connect s
 | Ctrl+R | Reply |
 | Ctrl+Shift+R | Reply All |
 | Ctrl+F | Forward |
-| Ctrl+D | Toggle dark mode |
 | Ctrl+Scroll | Zoom preview |
+| Ctrl++ or Ctrl+= | Zoom in |
+| Ctrl+- | Zoom out |
+| Ctrl+0 | Reset zoom |
+| Ctrl+Enter | Send message (in compose) |
 | Delete | Delete message |
 | Escape | Clear filter / Discard compose |
 
