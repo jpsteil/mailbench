@@ -1682,6 +1682,11 @@ class MailbenchWindow(QMainWindow):
         self._preview_to.setStyleSheet("color: #000000;")
         header_layout.addWidget(self._preview_to)
 
+        self._preview_cc = QLabel("")
+        self._preview_cc.setStyleSheet("color: #000000;")
+        self._preview_cc.hide()  # Hidden when no CC
+        header_layout.addWidget(self._preview_cc)
+
         self._preview_subject = QLabel("")
         self._preview_subject.setStyleSheet("font-weight: bold; font-size: 12pt; color: #000000;")
         self._preview_subject.setWordWrap(True)
@@ -2250,6 +2255,7 @@ class MailbenchWindow(QMainWindow):
         # Clear preview pane and current message state
         self._preview_from.setText("")
         self._preview_to.setText("")
+        self._preview_cc.hide()
         self._preview_subject.setText("")
         self._preview_date.setText("")
         self._clear_attachments_display()
@@ -2482,6 +2488,14 @@ class MailbenchWindow(QMainWindow):
             else:
                 to_str = str(recipients)
             self._preview_to.setText(f"To: {to_str}")
+
+        # Update CC field
+        cc = data.get('cc', '')
+        if cc:
+            self._preview_cc.setText(f"Cc: {cc}")
+            self._preview_cc.show()
+        else:
+            self._preview_cc.hide()
 
         # Show attachments
         attachments = data.get('attachments', [])
@@ -3139,6 +3153,7 @@ class MailbenchWindow(QMainWindow):
         self._preview_from.setText("From:")
         self._sender_verification.hide()
         self._preview_to.setText("To:")
+        self._preview_cc.hide()
         self._preview_subject.setText("")
         self._preview_date.setText("")
         if self._use_webengine:
@@ -3463,6 +3478,7 @@ class MailbenchWindow(QMainWindow):
                 self._current_message_id = None
                 self._preview_from.setText("From:")
                 self._preview_to.setText("To:")
+                self._preview_cc.hide()
                 self._preview_subject.setText("")
                 self._preview_date.setText("")
                 if self._use_webengine:
