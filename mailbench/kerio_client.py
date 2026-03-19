@@ -57,6 +57,7 @@ class KerioConfig:
     username: str
     password: str
     server: str  # e.g., "mail.company.com"
+    display_name: str = ""  # User's full name for From field
 
 
 class KerioSession:
@@ -126,6 +127,14 @@ class KerioSession:
 
         result = self.call("Session.login", params)
         self.token = result.get("token")
+        if self.token:
+            # Fetch user's display name
+            try:
+                user_info = self.whoami()
+                user_details = user_info.get("userDetails", {})
+                self.config.display_name = user_details.get("fullName", "")
+            except Exception:
+                pass
         return self.token is not None
 
     def logout(self):
@@ -815,8 +824,13 @@ class SyncManager:
                 cc_list = [build_recipient(addr) for addr in (cc or [])]
                 bcc_list = [build_recipient(addr) for addr in (bcc or [])]
 
+                # Build from field with display name if available
+                from_field = {"address": session.config.email}
+                if session.config.display_name:
+                    from_field["name"] = session.config.display_name
+
                 mail = {
-                    "from": {"address": session.config.email},
+                    "from": from_field,
                     "to": to_list,
                     "subject": subject,
                     "displayableParts": [{
@@ -1343,3 +1357,400 @@ class SyncManager:
                 self._ui_callback(callback, False, str(e), None)
 
         self.executor.submit(do_find)
+
+    # ==================== Contacts API ====================
+
+    def sync_contact_folders(self, account_id: int, callback: Optional[Callable] = None):
+        """Sync contact folders from Kerio."""
+        def do_sync():
+            try:
+                session = self.pool.get_session(account_id)
+                if not session:
+                    self._ui_callback(callback, False, "Account not connected", [])
+                    return
+
+                result = session.call("Folders.get")
+                folders = result.get("list", [])
+
+                contact_folders = []
+                for folder in folders:
+                    folder_type = folder.get("type", "").lower()
+                    if folder_type == "fcontact":
+                        contact_folders.append({
+                            "folder_id": folder.get("id", ""),
+                            "name": folder.get("name", ""),
+                            "parent_id": folder.get("parentId"),
+                            "is_default": folder.get("isDefault", False)
+                        })
+
+                self._ui_callback(callback, True, None, contact_folders)
+
+            except Exception as e:
+                self._ui_callback(callback, False, str(e), [])
+
+        self.executor.submit(do_sync)
+
+    def fetch_contacts_full(self, account_id: int, folder_id: str,
+                            callback: Optional[Callable] = None):
+        """Fetch all contacts from a contact folder with full details."""
+        def do_fetch():
+            try:
+                session = self.pool.get_session(account_id)
+                if not session:
+                    self._ui_callback(callback, False, "Account not connected", [])
+                    return
+
+                result = session.call("Contacts.get", {
+                    "folderIds": [folder_id],
+                    "query": {
+                        "start": 0,
+                        "limit": 1000
+                    }
+                })
+
+                contacts = result.get("list", [])
+                contacts_data = []
+
+                for contact in contacts:
+                    # Build name from available fields
+                    common_name = contact.get("commonName", "")
+                    if not common_name:
+                        first = contact.get("firstName", "")
+                        last = contact.get("surName", "")
+                        common_name = f"{first} {last}".strip()
+
+                    # Extract email addresses
+                    emails = []
+                    for email_obj in contact.get("emailAddresses", []):
+                        if isinstance(email_obj, dict):
+                            emails.append({
+                                "address": email_obj.get("address", ""),
+                                "type": email_obj.get("type", "work")
+                            })
+                        else:
+                            emails.append({"address": str(email_obj), "type": "work"})
+
+                    # Extract phone numbers
+                    phones = []
+                    for phone_obj in contact.get("phoneNumbers", []):
+                        if isinstance(phone_obj, dict):
+                            phones.append({
+                                "number": phone_obj.get("number", ""),
+                                "type": phone_obj.get("type", "work")
+                            })
+                        else:
+                            phones.append({"number": str(phone_obj), "type": "work"})
+
+                    # Extract addresses
+                    home_addr = contact.get("homeAddress", {})
+                    work_addr = contact.get("businessAddress", {})
+
+                    contacts_data.append({
+                        "item_id": contact.get("id", ""),
+                        "folder_id": folder_id,
+                        "common_name": common_name,
+                        "first_name": contact.get("firstName", ""),
+                        "last_name": contact.get("surName", ""),
+                        "nickname": contact.get("nickName", ""),
+                        "title": contact.get("titleBefore", ""),
+                        "company": contact.get("companyName", ""),
+                        "job_title": contact.get("jobTitle", ""),
+                        "department": contact.get("department", ""),
+                        "email_addresses": emails,
+                        "phone_numbers": phones,
+                        "home_address": home_addr if home_addr else None,
+                        "work_address": work_addr if work_addr else None,
+                        "website": contact.get("webPage", ""),
+                        "birthday": contact.get("birthDay", ""),
+                        "anniversary": contact.get("anniversary", ""),
+                        "notes": contact.get("note", ""),
+                        "photo_url": contact.get("photoUrl", "")
+                    })
+
+                self._ui_callback(callback, True, None, contacts_data)
+
+            except Exception as e:
+                self._ui_callback(callback, False, str(e), [])
+
+        self.executor.submit(do_fetch)
+
+    def create_contact(self, account_id: int, folder_id: str, contact_data: dict,
+                       callback: Optional[Callable] = None):
+        """Create a new contact in the specified folder."""
+        def do_create():
+            try:
+                session = self.pool.get_session(account_id)
+                if not session:
+                    self._ui_callback(callback, False, "Account not connected", None)
+                    return
+
+                # Build contact structure for Kerio API
+                contact = {
+                    "folderId": folder_id,
+                    "commonName": contact_data.get("common_name", ""),
+                    "firstName": contact_data.get("first_name", ""),
+                    "surName": contact_data.get("last_name", ""),
+                    "nickName": contact_data.get("nickname", ""),
+                    "titleBefore": contact_data.get("title", ""),
+                    "companyName": contact_data.get("company", ""),
+                    "jobTitle": contact_data.get("job_title", ""),
+                    "department": contact_data.get("department", ""),
+                    "webPage": contact_data.get("website", ""),
+                    "note": contact_data.get("notes", "")
+                }
+
+                # Add email addresses (Kerio uses TypeWork, TypeHome, TypeOther)
+                if contact_data.get("email_addresses"):
+                    contact["emailAddresses"] = [
+                        {"address": e.get("address", ""), "type": "TypeWork"}
+                        for e in contact_data["email_addresses"] if e.get("address")
+                    ]
+
+                # Add phone numbers (just the number, let Kerio handle the type)
+                if contact_data.get("phone_numbers"):
+                    contact["phoneNumbers"] = [
+                        {"number": p.get("number", "")}
+                        for p in contact_data["phone_numbers"] if p.get("number")
+                    ]
+
+                # Add addresses
+                if contact_data.get("home_address"):
+                    contact["homeAddress"] = contact_data["home_address"]
+                if contact_data.get("work_address"):
+                    contact["businessAddress"] = contact_data["work_address"]
+
+                result = session.call("Contacts.create", {"contacts": [contact]})
+
+                # Get created contact ID
+                created = result.get("result", [])
+                if created and len(created) > 0:
+                    contact_id = created[0].get("id", "")
+                    self._ui_callback(callback, True, None, contact_id)
+                else:
+                    self._ui_callback(callback, True, None, None)
+
+            except Exception as e:
+                self._ui_callback(callback, False, str(e), None)
+
+        self.executor.submit(do_create)
+
+    def update_contact(self, account_id: int, contact_id: str, contact_data: dict,
+                       callback: Optional[Callable] = None):
+        """Update an existing contact."""
+        def do_update():
+            try:
+                session = self.pool.get_session(account_id)
+                if not session:
+                    self._ui_callback(callback, False, "Account not connected")
+                    return
+
+                # Build contact structure for Kerio API
+                contact = {
+                    "id": contact_id,
+                    "commonName": contact_data.get("common_name", ""),
+                    "firstName": contact_data.get("first_name", ""),
+                    "surName": contact_data.get("last_name", ""),
+                    "nickName": contact_data.get("nickname", ""),
+                    "titleBefore": contact_data.get("title", ""),
+                    "companyName": contact_data.get("company", ""),
+                    "jobTitle": contact_data.get("job_title", ""),
+                    "department": contact_data.get("department", ""),
+                    "webPage": contact_data.get("website", ""),
+                    "note": contact_data.get("notes", "")
+                }
+
+                # Add email addresses (Kerio uses TypeWork, TypeHome, TypeOther)
+                emails = contact_data.get("email_addresses", [])
+                if isinstance(emails, str):
+                    import json
+                    try:
+                        emails = json.loads(emails)
+                    except:
+                        emails = []
+                if emails:
+                    contact["emailAddresses"] = [
+                        {"address": e.get("address", ""), "type": "TypeWork"}
+                        for e in emails if isinstance(e, dict) and e.get("address")
+                    ]
+
+                # Add phone numbers (just the number, let Kerio handle the type)
+                phones = contact_data.get("phone_numbers", [])
+                if isinstance(phones, str):
+                    import json
+                    try:
+                        phones = json.loads(phones)
+                    except:
+                        phones = []
+                if phones:
+                    contact["phoneNumbers"] = [
+                        {"number": p.get("number", "")}
+                        for p in phones if isinstance(p, dict) and p.get("number")
+                    ]
+
+                # Add addresses
+                if contact_data.get("home_address"):
+                    contact["homeAddress"] = contact_data["home_address"]
+                if contact_data.get("work_address"):
+                    contact["businessAddress"] = contact_data["work_address"]
+
+                session.call("Contacts.set", {"contacts": [contact]})
+                self._ui_callback(callback, True, None)
+
+            except Exception as e:
+                self._ui_callback(callback, False, str(e))
+
+        self.executor.submit(do_update)
+
+    def delete_contact(self, account_id: int, contact_id: str,
+                       callback: Optional[Callable] = None):
+        """Delete a contact."""
+        def do_delete():
+            try:
+                session = self.pool.get_session(account_id)
+                if not session:
+                    self._ui_callback(callback, False, "Account not connected")
+                    return
+
+                session.call("Contacts.remove", {"ids": [contact_id]})
+                self._ui_callback(callback, True, None)
+
+            except Exception as e:
+                self._ui_callback(callback, False, str(e))
+
+        self.executor.submit(do_delete)
+
+    def fetch_contact_groups(self, account_id: int, folder_id: str,
+                             callback: Optional[Callable] = None):
+        """Fetch contact groups/distribution lists from a folder."""
+        def do_fetch():
+            try:
+                session = self.pool.get_session(account_id)
+                if not session:
+                    self._ui_callback(callback, False, "Account not connected", [])
+                    return
+
+                # Note: Kerio may use ContactGroups or DistributionLists
+                # Try ContactGroups first
+                try:
+                    result = session.call("ContactGroups.get", {
+                        "folderIds": [folder_id],
+                        "query": {"start": 0, "limit": 500}
+                    })
+                    groups = result.get("list", [])
+                except Exception:
+                    # Try DistributionLists as fallback
+                    try:
+                        result = session.call("DistributionLists.get", {
+                            "folderIds": [folder_id],
+                            "query": {"start": 0, "limit": 500}
+                        })
+                        groups = result.get("list", [])
+                    except Exception:
+                        groups = []
+
+                groups_data = []
+                for group in groups:
+                    groups_data.append({
+                        "item_id": group.get("id", ""),
+                        "folder_id": folder_id,
+                        "name": group.get("name", group.get("commonName", "")),
+                        "members": group.get("members", [])
+                    })
+
+                self._ui_callback(callback, True, None, groups_data)
+
+            except Exception as e:
+                self._ui_callback(callback, False, str(e), [])
+
+        self.executor.submit(do_fetch)
+
+    def fetch_server_users(self, account_id: int,
+                           callback: Optional[Callable] = None):
+        """Fetch users from the server's Global Address List (GAL)."""
+        def do_fetch():
+            try:
+                session = self.pool.get_session(account_id)
+                if not session:
+                    self._ui_callback(callback, False, "Account not connected", [])
+                    return
+
+                users = []
+
+                # Get GAL contacts from public folders
+                # First, find the GAL folder using Folders.getPublic
+                try:
+                    public_result = session.call("Folders.getPublic")
+                    gal_folder_id = None
+
+                    for f in public_result.get("list", []):
+                        ftype = f.get("type", "")
+                        subtype = f.get("subType", "")
+                        fname = f.get("name", "").lower()
+                        print(f"[GAL] Public folder: {f.get('name')} type={ftype} subtype={subtype}")
+
+                        # Look for GAL contacts folder (subtype FSubGalContacts or type fContact)
+                        if subtype == "FSubGalContacts" or (ftype == "FContact" and "gal" in fname):
+                            gal_folder_id = f.get("id")
+                            print(f"[GAL] Found GAL folder: {f.get('name')} id={gal_folder_id}")
+                            break
+                        # Also check for general public contacts folder
+                        if ftype == "FContact" and not gal_folder_id:
+                            gal_folder_id = f.get("id")
+                            print(f"[GAL] Found public contacts folder: {f.get('name')} id={gal_folder_id}")
+
+                    if gal_folder_id:
+                        # Fetch contacts from the GAL folder
+                        contacts_result = session.call("Contacts.get", {
+                            "folderIds": [gal_folder_id],
+                            "query": {
+                                "start": 0,
+                                "limit": 1000
+                            }
+                        })
+                        users = contacts_result.get("list", [])
+                        print(f"[GAL] Fetched {len(users)} contacts from GAL folder")
+                    else:
+                        print("[GAL] No GAL folder found in public folders")
+
+                except Exception as e:
+                    print(f"[GAL] Error fetching GAL: {e}")
+
+                contacts_data = []
+                for user in users:
+                    # Handle different field names from GAL vs Users API
+                    email = ""
+                    if user.get("emailAddresses"):
+                        emails = user.get("emailAddresses", [])
+                        if emails:
+                            first = emails[0]
+                            email = first.get("address", "") if isinstance(first, dict) else str(first)
+                    elif user.get("emailAddress"):
+                        email = user.get("emailAddress", "")
+
+                    phone = ""
+                    if user.get("phoneNumbers"):
+                        phones = user.get("phoneNumbers", [])
+                        if phones:
+                            first = phones[0]
+                            phone = first.get("number", "") if isinstance(first, dict) else str(first)
+
+                    contacts_data.append({
+                        "item_id": user.get("id", ""),
+                        "folder_id": "__gal__",
+                        "common_name": user.get("commonName", user.get("fullName", "")),
+                        "first_name": user.get("firstName", ""),
+                        "last_name": user.get("lastName", ""),
+                        "email_addresses": [{"address": email, "type": "work"}] if email else [],
+                        "phone_numbers": [{"number": phone, "type": "work"}] if phone else [],
+                        "company": user.get("company", ""),
+                        "job_title": user.get("jobTitle", user.get("title", "")),
+                        "department": user.get("department", ""),
+                        "is_gal": True  # Mark as GAL entry (read-only)
+                    })
+
+                self._ui_callback(callback, True, None, contacts_data)
+
+            except Exception as e:
+                self._ui_callback(callback, False, str(e), [])
+
+        self.executor.submit(do_fetch)

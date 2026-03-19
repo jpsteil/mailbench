@@ -154,22 +154,118 @@ class Database:
                 )
             """)
 
-            # Contacts cache (Phase 2)
+            # Contact folders
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS contact_folders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL,
+                    folder_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    parent_id TEXT,
+                    is_default INTEGER DEFAULT 0,
+                    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+                    UNIQUE(account_id, folder_id)
+                )
+            """)
+
+            # Contacts (extended schema)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS contacts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     account_id INTEGER NOT NULL,
+                    folder_id TEXT NOT NULL,
                     item_id TEXT NOT NULL,
-                    display_name TEXT,
-                    email_addresses TEXT,
-                    phone_numbers TEXT,
+
+                    -- Names
+                    common_name TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    nickname TEXT,
+                    title TEXT,
+
+                    -- Work
                     company TEXT,
                     job_title TEXT,
+                    department TEXT,
+
+                    -- Multi-value (JSON arrays)
+                    email_addresses TEXT,
+                    phone_numbers TEXT,
+
+                    -- Addresses (JSON objects)
+                    home_address TEXT,
+                    work_address TEXT,
+
+                    -- Other
+                    website TEXT,
+                    birthday TEXT,
+                    anniversary TEXT,
                     notes TEXT,
+                    photo_url TEXT,
+
+                    -- Metadata
+                    is_favorite INTEGER DEFAULT 0,
                     cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
                     FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
                     UNIQUE(account_id, item_id)
                 )
+            """)
+
+            # Contact groups/distribution lists
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS contact_groups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL,
+                    folder_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    members TEXT,
+                    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+                    UNIQUE(account_id, item_id)
+                )
+            """)
+
+            # Migrate contacts table if needed (old schema -> new extended schema)
+            cursor = conn.execute("PRAGMA table_info(contacts)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if 'folder_id' not in columns and columns:
+                # Old contacts table exists, drop and recreate
+                conn.execute("DROP TABLE IF EXISTS contacts")
+                conn.execute("""
+                    CREATE TABLE contacts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        account_id INTEGER NOT NULL,
+                        folder_id TEXT NOT NULL DEFAULT '',
+                        item_id TEXT NOT NULL,
+                        common_name TEXT,
+                        first_name TEXT,
+                        last_name TEXT,
+                        nickname TEXT,
+                        title TEXT,
+                        company TEXT,
+                        job_title TEXT,
+                        department TEXT,
+                        email_addresses TEXT,
+                        phone_numbers TEXT,
+                        home_address TEXT,
+                        work_address TEXT,
+                        website TEXT,
+                        birthday TEXT,
+                        anniversary TEXT,
+                        notes TEXT,
+                        photo_url TEXT,
+                        is_favorite INTEGER DEFAULT 0,
+                        cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+                        UNIQUE(account_id, item_id)
+                    )
+                """)
+
+            # Index for contact search by folder
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_contacts_folder
+                ON contacts(account_id, folder_id)
             """)
 
             # Calendar events cache (Phase 2)
@@ -1041,4 +1137,213 @@ class Database:
                     INSERT OR IGNORE INTO allowed_domains (domain)
                     VALUES (?)
                 """, (domain,))
+            conn.commit()
+
+    # ==================== Contact Folders ====================
+
+    def get_contact_folders(self, account_id: int) -> list:
+        """Get all contact folders for an account."""
+        with self._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("""
+                SELECT id, folder_id, name, parent_id, is_default
+                FROM contact_folders
+                WHERE account_id = ?
+                ORDER BY is_default DESC, name
+            """, (account_id,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def save_contact_folder(self, account_id: int, folder_id: str, name: str,
+                            parent_id: str = None, is_default: bool = False):
+        """Save or update a contact folder."""
+        with self._get_conn() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO contact_folders
+                    (account_id, folder_id, name, parent_id, is_default)
+                VALUES (?, ?, ?, ?, ?)
+            """, (account_id, folder_id, name, parent_id, 1 if is_default else 0))
+            conn.commit()
+
+    def clear_contact_folders(self, account_id: int):
+        """Clear all contact folders for an account."""
+        with self._get_conn() as conn:
+            conn.execute("DELETE FROM contact_folders WHERE account_id = ?", (account_id,))
+            conn.commit()
+
+    # ==================== Contacts ====================
+
+    def save_contact(self, account_id: int, folder_id: str, item_id: str,
+                     common_name: str = None, first_name: str = None, last_name: str = None,
+                     nickname: str = None, title: str = None, company: str = None,
+                     job_title: str = None, department: str = None,
+                     email_addresses: str = None, phone_numbers: str = None,
+                     home_address: str = None, work_address: str = None,
+                     website: str = None, birthday: str = None, anniversary: str = None,
+                     notes: str = None, photo_url: str = None, is_favorite: bool = False):
+        """Save or update a contact."""
+        with self._get_conn() as conn:
+            conn.execute("""
+                INSERT INTO contacts
+                    (account_id, folder_id, item_id, common_name, first_name, last_name,
+                     nickname, title, company, job_title, department, email_addresses,
+                     phone_numbers, home_address, work_address, website, birthday,
+                     anniversary, notes, photo_url, is_favorite)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id, item_id) DO UPDATE SET
+                    folder_id = excluded.folder_id,
+                    common_name = excluded.common_name,
+                    first_name = excluded.first_name,
+                    last_name = excluded.last_name,
+                    nickname = excluded.nickname,
+                    title = excluded.title,
+                    company = excluded.company,
+                    job_title = excluded.job_title,
+                    department = excluded.department,
+                    email_addresses = excluded.email_addresses,
+                    phone_numbers = excluded.phone_numbers,
+                    home_address = excluded.home_address,
+                    work_address = excluded.work_address,
+                    website = excluded.website,
+                    birthday = excluded.birthday,
+                    anniversary = excluded.anniversary,
+                    notes = excluded.notes,
+                    photo_url = excluded.photo_url,
+                    is_favorite = excluded.is_favorite,
+                    cached_at = CURRENT_TIMESTAMP
+            """, (account_id, folder_id, item_id, common_name, first_name, last_name,
+                  nickname, title, company, job_title, department, email_addresses,
+                  phone_numbers, home_address, work_address, website, birthday,
+                  anniversary, notes, photo_url, 1 if is_favorite else 0))
+            conn.commit()
+
+    def get_contacts(self, account_id: int, folder_id: str = None) -> list:
+        """Get contacts, optionally filtered by folder."""
+        with self._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            if folder_id:
+                cursor = conn.execute("""
+                    SELECT * FROM contacts
+                    WHERE account_id = ? AND folder_id = ?
+                    ORDER BY common_name, last_name, first_name
+                """, (account_id, folder_id))
+            else:
+                cursor = conn.execute("""
+                    SELECT * FROM contacts
+                    WHERE account_id = ?
+                    ORDER BY common_name, last_name, first_name
+                """, (account_id,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_contact(self, account_id: int, item_id: str) -> dict:
+        """Get a single contact by item_id."""
+        with self._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("""
+                SELECT * FROM contacts
+                WHERE account_id = ? AND item_id = ?
+            """, (account_id, item_id))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_contact_by_id(self, contact_id: int) -> dict:
+        """Get a single contact by database id."""
+        with self._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("""
+                SELECT * FROM contacts WHERE id = ?
+            """, (contact_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def delete_contact(self, account_id: int, item_id: str):
+        """Delete a contact."""
+        with self._get_conn() as conn:
+            conn.execute("""
+                DELETE FROM contacts
+                WHERE account_id = ? AND item_id = ?
+            """, (account_id, item_id))
+            conn.commit()
+
+    def clear_contacts(self, account_id: int, folder_id: str = None):
+        """Clear contacts for an account, optionally by folder."""
+        with self._get_conn() as conn:
+            if folder_id:
+                conn.execute("""
+                    DELETE FROM contacts
+                    WHERE account_id = ? AND folder_id = ?
+                """, (account_id, folder_id))
+            else:
+                conn.execute("""
+                    DELETE FROM contacts WHERE account_id = ?
+                """, (account_id,))
+            conn.commit()
+
+    def search_contacts(self, account_id: int, query: str) -> list:
+        """Search contacts by name, email, company."""
+        query = f"%{query}%"
+        with self._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("""
+                SELECT * FROM contacts
+                WHERE account_id = ? AND (
+                    common_name LIKE ? COLLATE NOCASE OR
+                    first_name LIKE ? COLLATE NOCASE OR
+                    last_name LIKE ? COLLATE NOCASE OR
+                    email_addresses LIKE ? COLLATE NOCASE OR
+                    company LIKE ? COLLATE NOCASE
+                )
+                ORDER BY common_name, last_name, first_name
+            """, (account_id, query, query, query, query, query))
+            return [dict(row) for row in cursor.fetchall()]
+
+    # ==================== Contact Groups ====================
+
+    def save_contact_group(self, account_id: int, folder_id: str, item_id: str,
+                           name: str, members: str = None):
+        """Save or update a contact group."""
+        with self._get_conn() as conn:
+            conn.execute("""
+                INSERT INTO contact_groups
+                    (account_id, folder_id, item_id, name, members)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(account_id, item_id) DO UPDATE SET
+                    folder_id = excluded.folder_id,
+                    name = excluded.name,
+                    members = excluded.members
+            """, (account_id, folder_id, item_id, name, members))
+            conn.commit()
+
+    def get_contact_groups(self, account_id: int, folder_id: str = None) -> list:
+        """Get contact groups, optionally filtered by folder."""
+        with self._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            if folder_id:
+                cursor = conn.execute("""
+                    SELECT * FROM contact_groups
+                    WHERE account_id = ? AND folder_id = ?
+                    ORDER BY name
+                """, (account_id, folder_id))
+            else:
+                cursor = conn.execute("""
+                    SELECT * FROM contact_groups
+                    WHERE account_id = ?
+                    ORDER BY name
+                """, (account_id,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def delete_contact_group(self, account_id: int, item_id: str):
+        """Delete a contact group."""
+        with self._get_conn() as conn:
+            conn.execute("""
+                DELETE FROM contact_groups
+                WHERE account_id = ? AND item_id = ?
+            """, (account_id, item_id))
+            conn.commit()
+
+    def clear_contact_groups(self, account_id: int):
+        """Clear all contact groups for an account."""
+        with self._get_conn() as conn:
+            conn.execute("""
+                DELETE FROM contact_groups WHERE account_id = ?
+            """, (account_id,))
             conn.commit()

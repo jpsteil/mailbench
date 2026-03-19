@@ -38,8 +38,12 @@ from PySide6.QtGui import (
 from mailbench.database import Database
 from mailbench.kerio_client import KerioConnectionPool, SyncManager, KerioConfig
 from mailbench.blocklist import BlocklistManager
+from mailbench.contacts_manager import ContactsManager
 from mailbench.version import __version__
 from mailbench.views.folder_panel import FolderPanel
+from mailbench.views.module_switcher import ModuleSwitcher
+from mailbench.views.contacts_panel import ContactsPanel
+from mailbench.views.contact_detail import ContactDetailView
 
 
 def get_icon(theme_names: list, standard_pixmap: QStyle.StandardPixmap = None) -> QIcon:
@@ -1302,7 +1306,12 @@ class MailbenchWindow(QMainWindow):
         self.kerio_pool = KerioConnectionPool()
         self.sync_manager = SyncManager(self.kerio_pool, self.db, self)
         self.blocklist_manager = BlocklistManager(self.db, self.sync_manager)
+        self.contacts_manager = ContactsManager(self.db, self.sync_manager)
         self._junk_folder_id: Optional[str] = None
+
+        # Module state
+        self._current_module = 'mail'
+        self._contacts_loaded = False
 
         # Track state
         self.connected_accounts: set[int] = set()
@@ -1551,16 +1560,48 @@ class MailbenchWindow(QMainWindow):
         self._delete_action.setEnabled(enabled)
 
     def _create_main_layout(self):
-        """Create the 3-pane layout."""
+        """Create the main layout with module switcher and content area."""
         central = QWidget()
         self.setCentralWidget(central)
 
         layout = QHBoxLayout(central)
-        layout.setContentsMargins(5, 5, 5, 5)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Module switcher (leftmost, 48px wide)
+        self._module_switcher = ModuleSwitcher()
+        self._module_switcher.moduleSelected.connect(self._on_module_selected)
+        layout.addWidget(self._module_switcher)
+
+        # Content stack for different modules
+        self._content_stack = QStackedWidget()
+
+        # Index 0: Mail view
+        self._mail_widget = self._create_mail_view()
+        self._content_stack.addWidget(self._mail_widget)
+
+        # Index 1: Contacts view
+        self._contacts_view_widget = self._create_contacts_view()
+        self._content_stack.addWidget(self._contacts_view_widget)
+
+        # Index 2: Placeholder for Calendar/Tasks/Notes
+        placeholder = QLabel("Coming Soon")
+        placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        placeholder.setStyleSheet("font-size: 18pt; color: gray;")
+        self._content_stack.addWidget(placeholder)
+
+        layout.addWidget(self._content_stack, 1)
+
+    def _create_mail_view(self) -> QWidget:
+        """Create the mail view with folder panel, message list, and preview."""
+        mail_widget = QWidget()
+        mail_layout = QHBoxLayout(mail_widget)
+        mail_layout.setContentsMargins(5, 5, 5, 5)
+        mail_layout.setSpacing(0)
 
         # Main splitter
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
-        layout.addWidget(self._splitter)
+        mail_layout.addWidget(self._splitter)
 
         # Left pane - Folder panel
         folder_widget = QWidget()
@@ -1809,6 +1850,218 @@ class MailbenchWindow(QMainWindow):
         self._splitter.setChildrenCollapsible(False)
         self._right_splitter.setChildrenCollapsible(False)
 
+        return mail_widget
+
+    def _create_contacts_view(self) -> QWidget:
+        """Create the contacts view with folder panel, contact list, and detail view."""
+        contacts_widget = QWidget()
+        contacts_layout = QHBoxLayout(contacts_widget)
+        contacts_layout.setContentsMargins(5, 5, 5, 5)
+        contacts_layout.setSpacing(0)
+
+        # Splitter for contacts panel and detail view
+        contacts_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Left: Contacts panel (folders + list)
+        self._contacts_panel = ContactsPanel()
+        self._contacts_panel.folderSelected.connect(self._on_contact_folder_selected)
+        self._contacts_panel.contactSelected.connect(self._on_contact_selected)
+        self._contacts_panel.contactDoubleClicked.connect(self._on_contact_double_clicked)
+        self._contacts_panel.newContactRequested.connect(self._on_new_contact)
+        self._contacts_panel.newMessageToContact.connect(self._compose_to_contact)
+        contacts_splitter.addWidget(self._contacts_panel)
+
+        # Right: Contact detail view
+        self._contact_detail = ContactDetailView()
+        self._contact_detail.saveRequested.connect(self._on_contact_save)
+        self._contact_detail.deleteRequested.connect(self._on_contact_delete)
+        self._contact_detail.newMessageRequested.connect(self._compose_to_contact)
+        contacts_splitter.addWidget(self._contact_detail)
+
+        # Set splitter sizes
+        contacts_splitter.setSizes([400, 500])
+        contacts_splitter.setChildrenCollapsible(False)
+
+        contacts_layout.addWidget(contacts_splitter)
+        return contacts_widget
+
+    def _on_module_selected(self, module: str):
+        """Handle module selection from the switcher."""
+        self._current_module = module
+        if module == 'mail':
+            self._content_stack.setCurrentIndex(0)
+        elif module == 'contacts':
+            self._content_stack.setCurrentIndex(1)
+            self._ensure_contacts_loaded()
+        else:
+            # Calendar, Tasks, Notes - show placeholder
+            self._content_stack.setCurrentIndex(2)
+
+    def _ensure_contacts_loaded(self):
+        """Ensure contacts are loaded for the current account."""
+        if not self._current_account_id or not self.connected_accounts:
+            return
+
+        if self._contacts_loaded:
+            return
+
+        # Get account info
+        account = self.db.get_account(self._current_account_id)
+        if not account:
+            return
+
+        self._contacts_panel.set_account(self._current_account_id, account.get('email', ''))
+
+        # Initialize contacts manager and sync folders
+        def on_folders_synced(success, error, folders):
+            if not success:
+                self._statusbar.showMessage(f"Failed to load contacts: {error}")
+                return
+
+            # Add folders to panel
+            for folder in folders:
+                self._contacts_panel.add_folder(
+                    folder.get("folder_id", ""),
+                    folder.get("name", ""),
+                    folder.get("is_default", False)
+                )
+
+            # If we have folders, load contacts from the first one
+            if folders:
+                first_folder = folders[0]
+                self._load_contacts_folder(first_folder.get("folder_id", ""))
+
+            self._contacts_loaded = True
+            self._statusbar.showMessage("Contacts loaded")
+
+        self.contacts_manager.initialize(self._current_account_id, on_folders_synced)
+
+    def _load_contacts_folder(self, folder_id: str):
+        """Load contacts from a folder."""
+        if not self._current_account_id:
+            return
+
+        def on_contacts_loaded(success, error, contacts):
+            if not success:
+                self._statusbar.showMessage(f"Failed to load contacts: {error}")
+                return
+
+            # Transform to display format
+            display_contacts = []
+            for c in contacts:
+                display_contacts.append({
+                    "item_id": c.get("item_id", ""),
+                    "common_name": c.get("common_name", ""),
+                    "first_name": c.get("first_name", ""),
+                    "last_name": c.get("last_name", ""),
+                    "email_addresses": c.get("email_addresses", []),
+                    "phone_numbers": c.get("phone_numbers", []),
+                    "company": c.get("company", ""),
+                    "job_title": c.get("job_title", ""),
+                    "department": c.get("department", ""),
+                    "is_gal": c.get("is_gal", False),
+                })
+            self._contacts_panel.set_contacts(display_contacts)
+
+        if folder_id == "__all__":
+            # Load all contacts
+            self.contacts_manager.sync_all_contacts(on_contacts_loaded)
+        elif folder_id == "__company__":
+            # Load users from server's Global Address List (GAL)
+            self.sync_manager.fetch_server_users(
+                self._current_account_id,
+                on_contacts_loaded
+            )
+        else:
+            self.contacts_manager.sync_contacts(folder_id, on_contacts_loaded)
+
+    def _on_contact_folder_selected(self, account_id: int, folder_id: str, folder_name: str):
+        """Handle contact folder selection."""
+        self._load_contacts_folder(folder_id)
+
+    def _on_contact_selected(self, account_id: int, item_id: str):
+        """Handle contact selection."""
+        # First try to get from panel's current selection (works for GAL contacts)
+        contact = self._contacts_panel.get_selected_contact()
+        if not contact:
+            # Fallback to contacts_manager for regular contacts
+            contact = self.contacts_manager.get_contact(item_id)
+        if contact:
+            self._contact_detail.set_contact(contact)
+
+    def _on_contact_double_clicked(self, account_id: int, item_id: str):
+        """Handle contact double-click (enter edit mode)."""
+        # First try to get from panel's current selection (works for GAL contacts)
+        contact = self._contacts_panel.get_selected_contact()
+        if not contact:
+            # Fallback to contacts_manager for regular contacts
+            contact = self.contacts_manager.get_contact(item_id)
+        if contact:
+            self._contact_detail.set_contact(contact)
+            # Only enter edit mode for non-GAL contacts
+            if not contact.get("is_gal"):
+                self._contact_detail._enter_edit_mode()
+
+    def _on_new_contact(self):
+        """Handle new contact creation."""
+        folder_id = self._contacts_panel.current_folder_id()
+        if folder_id and folder_id != "__all__":
+            self._contact_detail.start_new_contact(folder_id)
+        else:
+            # Get first available folder
+            folders = self.contacts_manager.get_folders()
+            if folders:
+                self._contact_detail.start_new_contact(folders[0].get("folder_id", ""))
+
+    def _on_contact_save(self, contact_data: dict):
+        """Handle contact save request."""
+        item_id = contact_data.get("item_id", "")
+
+        def on_saved(success, error, *args):
+            if not success:
+                QMessageBox.critical(self, "Error", f"Failed to save contact: {error}")
+                return
+
+            # Reload contacts
+            folder_id = self._contacts_panel.current_folder_id()
+            if folder_id:
+                self._load_contacts_folder(folder_id)
+            self._statusbar.showMessage("Contact saved")
+
+        if item_id:
+            # Update existing
+            self.contacts_manager.update_contact(item_id, contact_data, on_saved)
+        else:
+            # Create new
+            folder_id = self._contacts_panel.current_folder_id()
+            if folder_id and folder_id != "__all__":
+                self.contacts_manager.create_contact(folder_id, contact_data, on_saved)
+
+    def _on_contact_delete(self, item_id: str):
+        """Handle contact delete request."""
+        def on_deleted(success, error):
+            if not success:
+                QMessageBox.critical(self, "Error", f"Failed to delete contact: {error}")
+                return
+
+            self._contact_detail.clear()
+            folder_id = self._contacts_panel.current_folder_id()
+            if folder_id:
+                self._load_contacts_folder(folder_id)
+            self._statusbar.showMessage("Contact deleted")
+
+        self.contacts_manager.delete_contact(item_id, on_deleted)
+
+    def _compose_to_contact(self, email: str, name: str):
+        """Compose a new message to a contact."""
+        # Switch to mail module
+        self._module_switcher.set_module('mail')
+        self._on_module_selected('mail')
+
+        # Open compose window with recipient
+        recipient = f'"{name}" <{email}>' if name else email
+        self._show_compose(initial_to=recipient)
+
     def _create_statusbar(self):
         """Create the status bar."""
         self._statusbar = QStatusBar()
@@ -2015,6 +2268,24 @@ class MailbenchWindow(QMainWindow):
         """Handle connection result."""
         if success:
             self.connected_accounts.add(account_id)
+
+            # Update account display name from Kerio if available
+            session = self.kerio_pool.get_session(account_id)
+            if session and session.config.display_name:
+                display_name = session.config.display_name
+                # Update account name in database
+                account = self.db.get_account(account_id)
+                if account:
+                    self.db.save_account(
+                        name=display_name,
+                        email=account['email'],
+                        server=account['server'],
+                        username=account['username'],
+                        password=account['password'],
+                        auth_type=account.get('auth_type', 'basic'),
+                        account_id=account_id
+                    )
+
             self._folder_panel.set_account(account_id, email.split('@')[0], email, connected=True)
             self._statusbar.showMessage(f"Connected to {email}")
             self._load_folders(account_id)
@@ -3254,7 +3525,7 @@ class MailbenchWindow(QMainWindow):
 
     # ==================== Compose (Inline) ====================
 
-    def _show_compose(self, reply_to=None, forward=None):
+    def _show_compose(self, reply_to=None, forward=None, initial_to=None):
         """Show the compose widget inline, replacing the preview pane."""
         from mailbench.views.compose import ComposeWidget
 
@@ -3280,6 +3551,10 @@ class MailbenchWindow(QMainWindow):
         # Set address book for autocomplete
         if self._address_book:
             self._compose_widget.set_address_book(self._address_book)
+
+        # Set initial recipient if provided
+        if initial_to:
+            self._compose_widget.to_edit.setText(initial_to)
 
         # Add to stack and switch to it
         self._preview_stack.addWidget(self._compose_widget)

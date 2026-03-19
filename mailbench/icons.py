@@ -77,6 +77,37 @@ _SVG_ACCOUNT = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fi
   <polyline points="22,6 12,13 2,6"/>
 </svg>'''
 
+# Module switcher icons (24x24)
+
+_SVG_MODULE_MAIL = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
+  <polyline points="22,6 12,13 2,6"/>
+</svg>'''
+
+_SVG_MODULE_CALENDAR = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3" y="4" width="18" height="18" rx="2" ry="2"/>
+  <line x1="16" y1="2" x2="16" y2="6"/>
+  <line x1="8" y1="2" x2="8" y2="6"/>
+  <line x1="3" y1="10" x2="21" y2="10"/>
+</svg>'''
+
+_SVG_MODULE_CONTACTS = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+  <circle cx="12" cy="7" r="4"/>
+</svg>'''
+
+_SVG_MODULE_TASKS = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M9 11l3 3L22 4"/>
+  <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
+</svg>'''
+
+_SVG_MODULE_NOTES = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/>
+  <polyline points="14,2 14,8 20,8"/>
+  <line x1="16" y1="13" x2="8" y2="13"/>
+  <line x1="16" y1="17" x2="8" y2="17"/>
+  <line x1="10" y1="9" x2="8" y2="9"/>
+</svg>'''
 
 # Cache for created icons
 _icon_cache = {}
@@ -112,4 +143,31 @@ def get_folder_icon(folder_type: str) -> QIcon:
     svg = svg_map.get(folder_type, _SVG_FOLDER)
     icon = _svg_to_icon(svg)
     _icon_cache[folder_type] = icon
+    return icon
+
+
+def get_module_icon(module_type: str) -> QIcon:
+    """Get a module icon for the module switcher.
+
+    Args:
+        module_type: One of 'mail', 'calendar', 'contacts', 'tasks', 'notes'
+
+    Returns:
+        QIcon for the module type
+    """
+    cache_key = f"module_{module_type}"
+    if cache_key in _icon_cache:
+        return _icon_cache[cache_key]
+
+    svg_map = {
+        'mail': _SVG_MODULE_MAIL,
+        'calendar': _SVG_MODULE_CALENDAR,
+        'contacts': _SVG_MODULE_CONTACTS,
+        'tasks': _SVG_MODULE_TASKS,
+        'notes': _SVG_MODULE_NOTES,
+    }
+
+    svg = svg_map.get(module_type, _SVG_MODULE_MAIL)
+    icon = _svg_to_icon(svg, size=24)
+    _icon_cache[cache_key] = icon
     return icon
